@@ -1,0 +1,37 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.chesscoach.trainer'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.chesscoach.trainer"
+        minSdk 24          // Android 7.0 — covers essentially every phone still in use
+        targetSdk 34
+        versionCode 2
+        versionName "1.1"
+    }
+
+    buildTypes {
+        // The debug build is signed with the standard Android debug key, which
+        // Gradle generates on its own. That is what lets the CI build run with no
+        // secrets to configure — see README.md if you'd rather sign it yourself.
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// No dependencies at all: the app is one Activity holding one WebView, and the
+// whole trainer is a single HTML file in app/src/main/assets. Nothing to resolve
+// means nothing to break when you rebuild this years from now.
+dependencies {
+}

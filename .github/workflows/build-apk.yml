@@ -1,0 +1,85 @@
+name: Build APK
+
+# Runs on every push to main, and whenever you press the button on the Actions tab.
+on:
+  push:
+    branches: [main, master]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+# Needed so the job can attach the finished APK to a release.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Points Gradle at the runner's preinstalled Android SDK and accepts the
+      # SDK licences, so the build has everything it needs without any manual setup.
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build the APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Give it a friendly filename
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/debug/app-debug.apk out/chess-coach.apk
+          ls -lh out/
+
+      # Downloadable from the run's summary page. Note that GitHub zips workflow
+      # artifacts and requires a login, which is awkward on a phone — the release
+      # step below is the one that gives you a direct .apk link.
+      - name: Upload as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chess-coach-apk
+          path: out/chess-coach.apk
+          if-no-files-found: error
+
+      # Keeps a single release tagged "latest" whose asset is always the newest
+      # build, so the download URL never changes. Open it on the phone and Android
+      # offers to install straight away.
+      - name: Publish it to the "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Chess Coach — latest build"
+          NOTES="Debug-signed APK, rebuilt automatically from the newest commit on \`${{ github.ref_name }}\`. Download **chess-coach.apk** below on your phone to install it."
+          # `create` sets the title only when the release does not exist yet, so an
+          # existing release keeps whatever title it was born with. `edit` is the half
+          # that actually keeps it current after a rename.
+          gh release create latest --title "$TITLE" --notes "$NOTES" \
+            || gh release edit latest --title "$TITLE" --notes "$NOTES"
+          gh release upload latest out/chess-coach.apk --clobber
+
+      - name: Where to find it
+        run: |
+          echo "### APK ready :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Open this on your phone and tap the \`.apk\` to install:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**https://github.com/${{ github.repository }}/releases/tag/latest**" >> $GITHUB_STEP_SUMMARY

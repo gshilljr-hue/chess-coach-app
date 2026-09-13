@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon (Android 8+): the launcher composites the king over the slate
+     ground and crops the result to whatever shape the device uses — circle,
+     squircle or rounded square. The foreground PNGs keep the glyph well inside
+     the safe zone so no mask clips it. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+</adaptive-icon>

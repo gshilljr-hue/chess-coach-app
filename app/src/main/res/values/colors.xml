@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matched to the page's own palette so the status bar and the window behind
+         the WebView don't flash a different colour on launch. -->
+    <color name="paper">#E8E1C8</color>
+    <color name="paper_night">#171310</color>
+    <!-- Slate blue, deliberately different from the Queen's Gambit trainer's
+         walnut and the Modern Defence trainer's green: all three sit together on
+         the home screen and the colour is what tells them apart at a glance. -->
+    <color name="ic_launcher_background">#2B3A55</color>
+</resources>

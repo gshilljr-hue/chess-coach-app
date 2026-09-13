@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Applied automatically when the phone is in dark mode (Android 10+).
+         On Android 7-9 there is no system-wide dark setting, so those devices
+         simply keep the light theme. -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/paper_night</item>
+        <item name="android:statusBarColor">@color/paper_night</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

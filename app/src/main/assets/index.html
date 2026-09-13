@@ -387,6 +387,17 @@
 .history-ribbon .v-inaccuracy{color:#8A6A15}
 .history-ribbon .v-mistake{color:#9A5B10}
 .history-ribbon .v-blunder,.history-ribbon .v-missed{color:#9B2C33;font-weight:600}
+.why{margin-top:.85rem;padding:.65rem .75rem;border-radius:10px;background:var(--panel-2);border-left:3px solid var(--ink-faint)}
+.why h4{margin:0 0 .35rem;font-size:.92rem}
+.why p{margin:0;font-size:.95rem;line-height:1.6}
+.why.v-best,.why.v-good{border-left-color:#6E8F5E}
+.why.v-inaccuracy{border-left-color:#C79A5D}
+.why.v-mistake{border-left-color:#D9843C}
+.why.v-blunder,.why.v-missed{border-left-color:#B44A50}
+.why-alt{display:block;margin-top:.5rem;color:var(--ink-soft)}
+.plan-head{display:flex;align-items:center;gap:.6rem;margin-bottom:.5rem}
+#panel-plan h3{font-size:1rem;margin:.2rem 0 .3rem}
+#panel-plan .plan-list li{margin-bottom:.45rem;line-height:1.55}
 </style>
 </head>
 <body>
@@ -480,7 +491,11 @@
     </div>
 
     <div class="tutor-column">
-      <div class="card" id="explain"></div>
+      <div class="ttabs" id="tutorTabs"></div>
+      <div class="tpanels">
+        <div class="tpanel active" id="panel-move"></div>
+        <div class="tpanel" id="panel-plan" hidden></div>
+      </div>
     </div>
   </div>
 
@@ -1371,6 +1386,417 @@ return {analyse, toProse, toShortProse, explain, clonePos,
 </script>
 <script>
 /* =========================================================================
+   THE STRATEGY LAYER — what to work toward, not what to play now.
+
+   The annotator explains a single move. This explains the POSITION: the things
+   that stay true for the next ten moves and that a plan has to be built around.
+   A club player who only ever hears "this move loses a pawn" never learns why
+   some positions want a minority attack and others want a knight on d5.
+
+   Everything here is derived from the board, never from a database of openings,
+   so it works just as well in a game that left theory on move four. Each rule
+   states its trigger in the comment above it, because a plan that fires in the
+   wrong position is worse than no plan at all.
+   ========================================================================= */
+const Strategy = (function(){
+
+const E = ChessEngine;
+const {WHITE, BLACK, sq, fileOf, rankOf, algebraic, fromAlgebraic, color, type} = E;
+const A = Annotator;
+
+const FILES = 'abcdefgh';
+const VALUE = {P:100, N:320, B:330, R:500, Q:900, K:0};
+const other = s => s===WHITE ? BLACK : WHITE;
+const sideName = s => s===WHITE ? 'White' : 'Black';
+const forward = s => s===WHITE ? 1 : -1;
+const pieces = (pos, side, t) => A.piecesOf(pos, side, t);
+
+function material(pos, side){
+  let m = 0;
+  for(const s of pieces(pos, side)) m += VALUE[type(pos.board[s])];
+  return m;
+}
+function nonPawnMaterial(pos){
+  let m = 0;
+  for(let i=0;i<64;i++){ const p = pos.board[i]; if(p && type(p)!=='P' && type(p)!=='K') m += VALUE[type(p)]; }
+  return m;
+}
+
+/* ---------------------------------------------------------------------------
+   PHASE
+   Endgame is really "are the queens off and is there little left", opening is
+   "are the pieces still at home". Everything between is the middlegame.
+   --------------------------------------------------------------------------- */
+function phase(pos){
+  const npm = nonPawnMaterial(pos);
+  const queens = pieces(pos, WHITE, 'Q').length + pieces(pos, BLACK, 'Q').length;
+  if(npm <= 2600 || (queens === 0 && npm <= 3400)) return 'endgame';
+  let home = 0;
+  for(const [side, r] of [[WHITE,0],[BLACK,7]])
+    for(const f of [1,2,5,6]){
+      const p = pos.board[sq(f,r)];
+      if(p && color(p)===side && (type(p)==='N' || type(p)==='B')) home++;
+    }
+  return home >= 5 ? 'opening' : 'middlegame';
+}
+
+/* ---------------------------------------------------------------------------
+   KING SAFETY
+   Where each king actually sits, which is what decides whether a pawn storm is
+   a plan or a self-inflicted wound.
+   --------------------------------------------------------------------------- */
+function kingZone(pos, side){
+  const k = pos.kingSquare(side);
+  if(k < 0) return null;
+  const f = fileOf(k), r = rankOf(k);
+  const home = r === (side===WHITE ? 0 : 7);
+  if(f >= 5) return {sq:k, where:'kingside', castled: home && f >= 6};
+  if(f <= 2) return {sq:k, where:'queenside', castled: home && f <= 2};
+  return {sq:k, where:'centre', castled:false};
+}
+
+/* Pawns still standing in front of a castled king. Three is intact; fewer is a
+   draught. */
+function shelter(pos, side){
+  const z = kingZone(pos, side);
+  if(!z || z.where === 'centre') return null;
+  const f = fileOf(z.sq);
+  let count = 0;
+  for(const nf of [f-1, f, f+1]){
+    if(nf<0||nf>7) continue;
+    if(pieces(pos, side, 'P').some(s => fileOf(s)===nf &&
+        Math.abs(rankOf(s) - rankOf(z.sq)) <= 2)) count++;
+  }
+  return count;
+}
+
+/* ---------------------------------------------------------------------------
+   PAWN MAJORITIES
+   A majority is where a passed pawn comes from, which is the single most
+   durable long-term asset in chess. Counted by wing, ignoring the d/e files.
+   --------------------------------------------------------------------------- */
+function majorities(pos){
+  const count = (side, files) => pieces(pos, side, 'P').filter(s => files.includes(fileOf(s))).length;
+  const Q = [0,1,2], K = [5,6,7];
+  return {
+    whiteQ: count(WHITE,Q), blackQ: count(BLACK,Q),
+    whiteK: count(WHITE,K), blackK: count(BLACK,K),
+  };
+}
+
+/* ---------------------------------------------------------------------------
+   BISHOPS
+   A bishop is "bad" when its own pawns sit on its colour and block it in. Count
+   them — three or more fixed pawns on the bishop's colour is the usual line.
+   --------------------------------------------------------------------------- */
+const isLight = s => (fileOf(s) + rankOf(s)) % 2 === 1;
+function bishopQuality(pos, side){
+  const out = [];
+  for(const b of pieces(pos, side, 'B')){
+    const lightSquared = isLight(b);
+    // Only CENTRAL pawns count. A bishop on c1 with pawns on b2, f2 and h2 is
+    // perfectly healthy — its diagonal is wide open. What makes a bishop bad is
+    // its own pawns parked in the middle on its colour, where they cannot get
+    // out of the way.
+    const central = pieces(pos, side, 'P')
+      .filter(s => isLight(s) === lightSquared && fileOf(s) >= 2 && fileOf(s) <= 5);
+    // ...and a pawn only really blocks if it cannot advance
+    const fixed = central.filter(s => {
+      const ahead = sq(fileOf(s), rankOf(s) + forward(side));
+      return rankOf(s) + forward(side) >= 0 && rankOf(s) + forward(side) < 8 && pos.board[ahead];
+    });
+    out.push({sq:b, lightSquared, blockers: central.length, fixed: fixed.length,
+              bad: central.length >= 3 && fixed.length >= 1});
+  }
+  return out;
+}
+
+/* Squares a side could plant a knight on and never be chased by a pawn. Only
+   the ones that are actually reachable-ish matter, so restrict to the middle
+   files and the half of the board nearer the opponent. */
+function outposts(pos, side){
+  const out = [];
+  for(let f = 1; f <= 6; f++){
+    for(let r = 0; r < 8; r++){
+      const adv = side===WHITE ? (r >= 3 && r <= 5) : (r >= 2 && r <= 4);
+      if(!adv) continue;
+      const s = sq(f, r);
+      const occupant = pos.board[s];
+      if(occupant && color(occupant) !== side) continue;
+      if(A.isOutpost(pos, s, side)) out.push(s);
+    }
+  }
+  return out;
+}
+
+/* Files with no pawns at all, and files where only one side has a pawn. */
+function files(pos){
+  const open = [], halfWhite = [], halfBlack = [];
+  for(let f = 0; f < 8; f++){
+    if(A.openFile(pos, f)) open.push(f);
+    else if(A.halfOpenFor(pos, f, WHITE)) halfWhite.push(f);
+    else if(A.halfOpenFor(pos, f, BLACK)) halfBlack.push(f);
+  }
+  return {open, halfWhite, halfBlack};
+}
+
+function rookOn(pos, side, f){
+  return pieces(pos, side, 'R').some(s => fileOf(s) === f);
+}
+
+/* Space: how many squares on the opponent's half each side's pawns control. A
+   crude count, but it tracks the feel of a position well enough to mention. */
+function space(pos, side){
+  let n = 0;
+  const dir = forward(side);
+  for(const s of pieces(pos, side, 'P')){
+    const r = rankOf(s) + dir;
+    if(r < 0 || r > 7) continue;
+    const theirHalf = side===WHITE ? r >= 4 : r <= 3;
+    if(!theirHalf) continue;
+    for(const df of [-1, 1]){
+      const f = fileOf(s) + df;
+      if(f >= 0 && f < 8) n++;
+    }
+  }
+  return n;
+}
+
+/* ---------------------------------------------------------------------------
+   CENTRE SHAPE
+   The named structures worth recognising, tested most-specific first.
+   --------------------------------------------------------------------------- */
+function centre(pos){
+  const wp = pieces(pos, WHITE, 'P'), bp = pieces(pos, BLACK, 'P');
+  const at = (list, alg) => list.includes(fromAlgebraic(alg));
+  const fileCount = (list, f) => list.filter(s => fileOf(s) === f).length;
+
+  const wIso = A.structure(pos, WHITE).isolated;
+  const bIso = A.structure(pos, BLACK).isolated;
+
+  // isolated queen's pawn: a lone d-pawn, no c- or e-pawn beside it
+  if(wIso.includes(3) && fileCount(wp,3) === 1 && !fileCount(bp,3))
+    return {key:'iqp-white', owner:WHITE};
+  if(bIso.includes(3) && fileCount(bp,3) === 1 && !fileCount(wp,3))
+    return {key:'iqp-black', owner:BLACK};
+
+  // hanging pawns: c and d abreast with no b or e pawn
+  if(fileCount(wp,2) && fileCount(wp,3) && !fileCount(wp,1) && !fileCount(wp,4))
+    return {key:'hanging-white', owner:WHITE};
+  if(fileCount(bp,2) && fileCount(bp,3) && !fileCount(bp,1) && !fileCount(bp,4))
+    return {key:'hanging-black', owner:BLACK};
+
+  // the big broad centre — three or four abreast on the fourth rank
+  const wBroad = ['c4','d4','e4','f4'].filter(a => at(wp,a)).length;
+  if(wBroad >= 3) return {key:'broad-white', owner:WHITE};
+  const bBroad = ['c5','d5','e5','f5'].filter(a => at(bp,a)).length;
+  if(bBroad >= 3) return {key:'broad-black', owner:BLACK};
+
+  // locked: pawns face each other and cannot pass
+  const locked = (at(wp,'d5') && at(bp,'d6') && at(bp,'e5') && at(wp,'e4')) ||
+                 (at(wp,'e5') && at(bp,'e6') && at(bp,'d5') && at(wp,'d4'));
+  if(locked) return {key:'locked', owner:null};
+
+  // fully open: no pawns left on d or e at all
+  if(!fileCount(wp,3) && !fileCount(bp,3) && !fileCount(wp,4) && !fileCount(bp,4))
+    return {key:'open', owner:null};
+
+  // classical tension: pawns on d4/d5 or e4/e5 still staring at each other
+  if((at(wp,'d4') && at(bp,'d5')) || (at(wp,'e4') && at(bp,'e5')))
+    return {key:'tension', owner:null};
+
+  return {key:'fluid', owner:null};
+}
+
+const CENTRE_PLANS = {
+  'iqp-white': {
+    name: 'Isolated queen’s pawn (White’s)',
+    what: 'White has a lone d-pawn with no neighbour to defend it. It costs something in the endgame and buys something in the middlegame.',
+    owner: 'The pawn gives you the e5 and c5 squares and a free d-file. Play for pieces: knight to e5, rooks to d1 and e1, and look for the d4-d5 break that turns the weakness into an attack before the queens come off.',
+    other: 'Blockade it. A knight on d5 in front of the pawn kills it, and every trade of pieces makes the pawn weaker. Aim for an endgame — that is where an isolated pawn simply falls.',
+  },
+  'iqp-black': {
+    name: 'Isolated queen’s pawn (Black’s)',
+    what: 'Black has a lone d-pawn with no neighbour to defend it — active pieces now, a weak pawn later.',
+    owner: 'Use the squares the pawn controls: a knight to e4 or c4, rooks to d8 and e8, and the ...d5-d4 break at the right moment. Keep pieces on.',
+    other: 'Blockade on d4, trade pieces, and head for the endgame where the pawn is just weak.',
+  },
+  'hanging-white': {
+    name: 'Hanging pawns (White’s c and d)',
+    what: 'White’s c- and d-pawns stand side by side with no pawns to support them. They control a lot of squares and they are a target.',
+    owner: 'Keep them abreast and look for d4-d5 or c4-c5 at a moment when it gains ground. They are strong while they can still advance.',
+    other: 'Pile on them and force one to advance — the moment one moves, the other becomes weak and the square in front of it becomes yours.',
+  },
+  'hanging-black': {
+    name: 'Hanging pawns (Black’s c and d)',
+    what: 'Black’s c- and d-pawns stand side by side with nothing to support them: space now, targets later.',
+    owner: 'Keep them level and time ...d5-d4 or ...c5-c4 to gain ground before White can attack them.',
+    other: 'Attack them until one has to advance, then occupy the square it left behind.',
+  },
+  'broad-white': {
+    name: 'Broad pawn centre (White’s)',
+    what: 'White has three or four pawns abreast. That is a lot of space and a lot of surface area.',
+    owner: 'Advance in the centre where it gains time, and use the space to swing pieces from one wing to the other faster than the opponent can.',
+    other: 'Strike at the base of it with a pawn — ...c5 or ...f6 or ...e6 — rather than trying to blockade. A big centre that cannot advance becomes a big collection of targets.',
+  },
+  'broad-black': {
+    name: 'Broad pawn centre (Black’s)',
+    what: 'Black has three or four pawns abreast: space, and a lot to defend.',
+    owner: 'Advance where it gains time and use the extra room to manoeuvre.',
+    other: 'Hit the base of the chain with a pawn break rather than sitting and watching it.',
+  },
+  'locked': {
+    name: 'Locked centre',
+    what: 'The central pawns are jammed against each other and nothing is going through the middle.',
+    owner: '',
+    other: '',
+    both: 'With the centre shut, the game is decided on the wings, and the rule is: play where your pawn chain points. Knights matter more than bishops here because they can jump the blockage, so find the outposts and be patient — the side that gets its break in first usually wins.',
+  },
+  'open': {
+    name: 'Open centre',
+    what: 'The d- and e-files are clear of pawns. Lines are open and everything happens quickly.',
+    both: 'King safety and development are everything now. Get castled, put rooks on the open files, and count tempi rather than pawns — an uncastled king in an open position is worth more than a piece to the opponent.',
+  },
+  'tension': {
+    name: 'Central tension',
+    what: 'Pawns still face each other in the middle and neither side has resolved it.',
+    both: 'Whoever releases the tension first usually concedes something — a square, a tempo, or the choice of structure. Improve a piece and make the opponent decide. When you do resolve it, do it on your terms: recapture with the piece that improves your position, not the one that is nearest.',
+  },
+  'fluid': {
+    name: 'Fluid centre',
+    what: 'The centre has not settled into a fixed shape yet.',
+    both: 'Keep options open. Develop toward the centre, castle, and wait for the structure to declare itself before committing to a wing.',
+  },
+};
+
+/* ---------------------------------------------------------------------------
+   THE READ
+   Collects everything and returns a small set of ranked, position-specific
+   observations plus a plan for each side.
+   --------------------------------------------------------------------------- */
+function read(pos){
+  const ph = phase(pos);
+  const c = centre(pos);
+  const plan = CENTRE_PLANS[c.key];
+  const f = files(pos);
+  const maj = majorities(pos);
+  const wKing = kingZone(pos, WHITE), bKing = kingZone(pos, BLACK);
+  const notes = [];
+  const add = (weight, side, text) => notes.push({weight, side, text});
+
+  /* --- kings: the thing that overrides everything else --- */
+  if(wKing && bKing){
+    const opposite = wKing.where !== bKing.where && wKing.where !== 'centre' && bKing.where !== 'centre'
+                     && wKing.castled && bKing.castled;
+    if(opposite){
+      add(100, null, `Kings have castled on opposite wings. Both sides should be throwing pawns at the other king, and in these races a tempo is worth more than a pawn — do not stop to defend, and do not trade off your attackers.`);
+    }
+    for(const [side, z] of [[WHITE,wKing],[BLACK,bKing]]){
+      if(ph !== 'endgame' && z.where === 'centre' && (f.open.length || ph === 'middlegame')){
+        add(95, side, `${sideName(side)}'s king is still in the centre with lines opening. Castling, or at least getting off the e-file, comes before anything else.`);
+      }
+      const sh = shelter(pos, side);
+      if(sh !== null && sh <= 1 && ph !== 'endgame')
+        add(80, side, `${sideName(side)}'s king has almost no pawn cover left. Trading queens would be a relief; leaving it as it is invites an attack.`);
+    }
+  }
+
+  /* --- open files: who claims them --- */
+  for(const file of f.open){
+    const w = rookOn(pos, WHITE, file), b = rookOn(pos, BLACK, file);
+    if(!w && !b) add(70, null, `The ${FILES[file]}-file is open and neither side has a rook on it. Getting there first is usually worth a move on its own.`);
+    else if(w && !b) add(55, WHITE, `White already owns the open ${FILES[file]}-file — double on it, or use it to invade on the seventh.`);
+    else if(b && !w) add(55, BLACK, `Black already owns the open ${FILES[file]}-file — double on it, or use it to invade on the second.`);
+  }
+  if(f.halfWhite.length && ph !== 'endgame'){
+    const file = f.halfWhite[0];
+    add(50, WHITE, `White has a half-open ${FILES[file]}-file: the black pawn on it cannot be defended by another pawn, so a rook there pressures something real.`);
+  }
+  if(f.halfBlack.length && ph !== 'endgame'){
+    const file = f.halfBlack[0];
+    add(50, BLACK, `Black has a half-open ${FILES[file]}-file: point a rook down it at the white pawn that cannot be defended by a pawn.`);
+  }
+
+  /* --- outposts --- */
+  for(const side of [WHITE, BLACK]){
+    const o = outposts(pos, side).filter(s => {
+      const p = pos.board[s];
+      return !p || type(p) !== 'N';                 // not already taken by a knight
+    });
+    if(o.length){
+      const best = o.sort((a,b)=>Math.abs(3.5-fileOf(a))-Math.abs(3.5-fileOf(b)))[0];
+      add(65, side, `${algebraic(best)} is an outpost for ${sideName(side)} — no enemy pawn can ever chase a piece off it. A knight there is worth more than a bishop anywhere.`);
+    }
+  }
+
+  /* --- majorities and where a passed pawn comes from --- */
+  if(maj.whiteQ > maj.blackQ && maj.blackK > maj.whiteK){
+    add(75, null, `Opposite pawn majorities: White's is on the queenside, Black's on the kingside. Each side should advance where they have the extra pawn, and each should be in no hurry to trade into the other's strength.`);
+  } else {
+    if(maj.whiteQ > maj.blackQ) add(60, WHITE, `White has a queenside pawn majority (${maj.whiteQ} against ${maj.blackQ}). Advancing it is the long-term route to a passed pawn, and it matters most once the queens come off.`);
+    if(maj.blackQ > maj.whiteQ) add(60, BLACK, `Black has a queenside pawn majority (${maj.blackQ} against ${maj.whiteQ}) — a passed pawn is waiting there in the endgame.`);
+    if(maj.whiteK > maj.blackK) add(58, WHITE, `White has a kingside pawn majority (${maj.whiteK} against ${maj.blackK}), which doubles as attacking material while the kings are still on.`);
+    if(maj.blackK > maj.whiteK) add(58, BLACK, `Black has a kingside pawn majority (${maj.blackK} against ${maj.whiteK}).`);
+  }
+
+  /* --- passed pawns --- */
+  for(const side of [WHITE, BLACK]){
+    const passed = A.structure(pos, side).passed;
+    if(passed.length){
+      const weight = ph === 'endgame' ? 92 : 68;
+      add(weight, side, `${sideName(side)} has a passed ${FILES[passed[0]]}-pawn.` +
+        (ph === 'endgame' ? ' In the endgame that is often the whole game: push it, and put the rook behind it.'
+                          : ' Keep it in mind — every trade makes it stronger, so simplification favours this side.'));
+    }
+  }
+
+  /* --- weak pawns worth playing against --- */
+  for(const side of [WHITE, BLACK]){
+    const st = A.structure(pos, side);
+    const them = other(side);
+    if(st.isolated.length && !(c.key === 'iqp-white' || c.key === 'iqp-black'))
+      add(52, them, `${sideName(side)}'s ${FILES[st.isolated[0]]}-pawn is isolated. It cannot be defended by a pawn, so pile pieces on it and trade down.`);
+    if(st.backward.length)
+      add(54, them, `${sideName(side)}'s ${FILES[st.backward[0]]}-pawn is backward on a half-open file — attack it where it stands, and take the square in front of it.`);
+    if(st.doubled.length)
+      add(45, them, `${sideName(side)} has doubled ${FILES[st.doubled[0]]}-pawns: fewer real pawns than the count suggests, and a target in an endgame.`);
+  }
+
+  /* --- bishops --- */
+  for(const side of [WHITE, BLACK]){
+    const bs = bishopQuality(pos, side);
+    const bad = bs.find(b => b.bad);
+    if(bad && ph !== 'opening'){
+      add(56, side, `${sideName(side)}'s ${bad.lightSquared ? 'light' : 'dark'}-squared bishop is hemmed in by its own pawns. Either trade it off, or get the pawns off its colour — a bad bishop defends nothing and attacks nothing.`);
+    }
+    if(bs.length === 2 && bishopQuality(pos, other(side)).length === 1 && ph !== 'opening')
+      add(57, side, `${sideName(side)} has the bishop pair. Open the position and avoid trading either one; two bishops grow stronger as pawns come off.`);
+  }
+
+  /* --- space --- */
+  const ws = space(pos, WHITE), bs2 = space(pos, BLACK);
+  if(ws - bs2 >= 4) add(48, WHITE, `White has the space advantage. Avoid trades — the cramped side is relieved by every exchange — and switch wings faster than Black can follow.`);
+  if(bs2 - ws >= 4) add(48, BLACK, `Black has the space advantage; keep pieces on and use the extra room to manoeuvre.`);
+
+  /* --- material --- */
+  const diff = material(pos, WHITE) - material(pos, BLACK);
+  if(Math.abs(diff) >= 150){
+    const up = diff > 0 ? WHITE : BLACK;
+    add(85, up, `${sideName(up)} is up material. The plan that wins it is trades: swap pieces at every fair opportunity, keep the queens off unless there is an attack, and head for an endgame.`);
+    add(84, other(up), `${sideName(other(up))} is down material and cannot afford a quiet game — look for activity, open lines at the king, and avoid every trade that does not relieve the pressure.`);
+  }
+
+  notes.sort((a,b) => b.weight - a.weight);
+  return {phase: ph, centre: c, centrePlan: plan, notes, files: f, majorities: maj,
+          kings: {white: wKing, black: bKing}};
+}
+
+return {read, phase, centre, files, majorities, outposts, bishopQuality, shelter, space, kingZone};
+})();
+
+</script>
+<script>
+/* =========================================================================
    LOZZA, WRAPPED
 
    Lozza is a UCI engine: you write text at it and it writes text back, and it
@@ -1679,6 +2105,7 @@ const state = {
   // free board
   free: {sans: [], fens: [ChessEngine.START], selected: null, targets: [], promo: null, thinking: false, engineLines: null},
   banner: null,
+  tab: 'move',           // 'move' | 'plan'
 };
 
 const $ = id => document.getElementById(id);
@@ -1779,14 +2206,19 @@ async function runAnalysis(){
       // negate. This is the only trustworthy way round: asking the engine to
       // score a nominated move via "searchmoves" returns the best move's score
       // instead, which grades every blunder as brilliant.
-      let playedEval;
+      let playedEval, refutation = null;
       if(bestLine.move === playedUci){
         playedEval = bestEval;                       // it WAS the engine's choice
+        refutation = bestLine.pv ? bestLine.pv.slice(1) : null;
       } else {
         const after = await Engine.analyse(g.fens[i+1], {movetime, fresh:false});
         playedEval = after.lines[0]
           ? Engine.negate({cp: after.lines[0].cp, mate: after.lines[0].mate})
           : bestEval;
+        // The engine's own continuation from the position the move created IS
+        // the refutation — no need to reason about why a move is bad when the
+        // engine will happily demonstrate it.
+        refutation = after.lines[0] ? after.lines[0].pv : null;
       }
 
       const loss = Math.max(0, Engine.scalar(bestEval) - Engine.scalar(playedEval));
@@ -1808,6 +2240,10 @@ async function runAnalysis(){
         loss, verdict, bestSan, bestNote,
         evalAfter: Engine.toWhitePov(playedEval, mover),
         depth: bestLine.depth,
+        refutationSan: refutation ? uciLineToSan(g.fens[i+1], refutation, 6) : null,
+        bestLineSan:   bestLine.pv ? uciLineToSan(g.fens[i], bestLine.pv, 5) : null,
+        swing: materialSwing(g.fens[i+1], refutation, mover),
+        mover,
       };
       renderProgress(i + 1, g.sans.length);
       if(i === state.ply - 1 || state.ply === 0) renderExplain();
@@ -1817,6 +2253,131 @@ async function runAnalysis(){
   state.analysing = false;
   renderProgress(g.sans.length, g.sans.length);
   render();
+}
+
+/* Turn a UCI principal variation into readable SAN, numbered from wherever it
+   starts. Stops early if anything does not replay — a PV can outlive its
+   position when the engine is cut off mid-iteration. */
+function uciLineToSan(fen, uciMoves, maxPlies){
+  if(!uciMoves || !uciMoves.length) return null;
+  const pos = posFromFen(fen);
+  const out = [];
+  for(const u of uciMoves.slice(0, maxPlies || 6)){
+    const legal = pos.legalMoves();
+    const m = uciToMove(pos, u);
+    if(!m) break;
+    out.push({san: pos.san(m, legal), white: pos.turn === ChessEngine.WHITE});
+    pos.makeMove(m);
+  }
+  return out.length ? out : null;
+}
+
+/* How much material changes hands along a line, from `mover`'s point of view.
+   Negative means the mover loses it. */
+function materialSwing(fen, uciMoves, mover){
+  if(!uciMoves || !uciMoves.length) return 0;
+  const V = {P:1, N:3, B:3, R:5, Q:9, K:0};
+  const count = pos => {
+    let w = 0, b = 0;
+    for(let i=0;i<64;i++){
+      const p = pos.board[i];
+      if(!p) continue;
+      const v = V[ChessEngine.type(p)];
+      if(ChessEngine.color(p) === ChessEngine.WHITE) w += v; else b += v;
+    }
+    return mover === ChessEngine.WHITE ? w - b : b - w;
+  };
+  const pos = posFromFen(fen);
+  const before = count(pos);
+  for(const u of uciMoves.slice(0, 8)){
+    const m = uciToMove(pos, u);
+    if(!m) break;
+    pos.makeMove(m);
+  }
+  return count(pos) - before;
+}
+
+/* Render a SAN line as "4.Qxf7# " or "4…Nxe5 5.Qxd8", numbering from the move
+   number the line actually starts at. */
+function lineText(line, startPly){
+  if(!line) return '';
+  let out = '', ply = startPly;
+  for(const step of line){
+    const no = Math.floor(ply/2) + 1;
+    if(step.white) out += `${no}.${step.san} `;
+    else out += (out === '' ? `${no}…${step.san} ` : `${step.san} `);
+    ply++;
+  }
+  return out.trim();
+}
+
+/* ---------------------------------------------------------------------------
+   WHY THE RATING
+   The verdict is a number; this is the reason behind it. Built from what the
+   engine actually intends to do next, plus what the move gave away in concrete
+   terms, phrased differently per tier so an inaccuracy does not read like a
+   disaster.
+   --------------------------------------------------------------------------- */
+function whyBlock(ver, i){
+  if(!ver) return '';
+  const key = ver.verdict.key;
+  const them = ver.mover === ChessEngine.WHITE ? 'Black' : 'White';
+  const us   = ver.mover === ChessEngine.WHITE ? 'White' : 'Black';
+  const reply = ver.refutationSan ? lineText(ver.refutationSan, i + 1) : null;
+  const swing = ver.swing || 0;
+  let head, body = '';
+
+  if(key === 'best' || key === 'good'){
+    head = key === 'best' ? 'Why it’s the best move' : 'Why it holds up';
+    const line = ver.bestLineSan ? lineText(ver.bestLineSan, i) : null;
+    body = line
+      ? `Nothing the opponent has changes the assessment — the engine expects <span class="mono">${escapeHtml(line)}</span>, and the evaluation barely moves.`
+      : `The engine finds nothing better, and no reply changes the assessment.`;
+    if(key === 'good' && ver.loss >= 15)
+      body += ` It gives up ${(ver.loss/100).toFixed(2)} against the very best move, which is well inside the margin that decides games at club level.`;
+    return {head, body};
+  }
+
+  const sev = {inaccuracy: 'an inaccuracy', mistake: 'a mistake', blunder: 'a blunder', missed: 'a missed mate'}[key];
+  head = `Why it’s ${sev}`;
+
+  if(key === 'missed'){
+    const line = ver.bestLineSan ? lineText(ver.bestLineSan, i) : null;
+    body = line
+      ? `There was a forced mate: <span class="mono">${escapeHtml(line)}</span>. The move played keeps a winning position, but the game should have ended here.`
+      : `A forced mate was available and this move lets the game go on.`;
+    return {head, body};
+  }
+
+  const bits = [];
+  if(reply) bits.push(`${them} answers <span class="mono">${escapeHtml(reply)}</span>`);
+  if(swing <= -3) bits.push(`and comes out a ${swing <= -8 ? 'queen' : swing <= -4 ? 'rook' : 'piece'} up on the exchange`);
+  else if(swing <= -1) bits.push(`and wins a pawn`);
+
+  if(ver.evalAfter && ver.evalAfter.mate !== null && ver.evalAfter.mate !== undefined){
+    body = reply ? `${them} has a forced mate: <span class="mono">${escapeHtml(reply)}</span>.`
+                 : `${them} has a forced mate from here.`;
+  } else if(bits.length){
+    body = bits.join(' ') + '.';
+  } else {
+    body = `${them} gets the better of the position from here.`;
+  }
+
+  if(ver.bestSan){
+    const line = ver.bestLineSan ? lineText(ver.bestLineSan, i) : null;
+    body += ` <span class="why-alt">Instead <span class="mono">${escapeHtml(ver.bestSan)}</span>` +
+            (line ? ` — the engine's line runs <span class="mono">${escapeHtml(line)}</span>` : '') +
+            `, and ${us} is ${describeEval(ver, i)}.</span>`;
+  }
+  return {head, body};
+}
+
+function describeEval(ver, i){
+  const cp = ver.loss;
+  if(cp > 5000) return 'still in the game';
+  if(cp >= 300) return 'a long way better off';
+  if(cp >= 100) return 'clearly better off';
+  return 'a little better off';
 }
 
 function uciToMove(pos, uci){
@@ -1833,7 +2394,9 @@ function render(){
   renderHeader();
   renderBoard();
   renderRibbon();
+  renderTabs();
   renderExplain();
+  renderPlan();
   renderControls();
   renderBanner();
 }
@@ -1949,7 +2512,7 @@ function renderProgress(done, total){
 }
 
 function renderExplain(){
-  const el = $('explain');
+  const el = $('panel-move');
   const v = view();
 
   if(state.mode === 'free'){
@@ -1997,14 +2560,90 @@ function renderExplain(){
     const cost = costText(ver);
     const lost = cost ? ` <span class="hint">(${escapeHtml(cost)})</span>` : '';
     html += `<p class="hint mono">Evaluation after: ${escapeHtml(evalText(ver.evalAfter))}${lost} · depth ${ver.depth}</p>`;
+
+    // the reason behind the rating, not just the rating
+    const why = whyBlock(ver, i);
+    if(why) html += `<div class="why v-${ver.verdict.key}"><h4>${why.head}</h4><p>${why.body}</p></div>`;
+
     if(ver.bestSan && ver.bestSan !== state.game.sans[i] && ver.verdict.key !== 'best' && ver.verdict.key !== 'good'){
-      html += `<div class="better"><h4>The engine wanted <span class="mono">${escapeHtml(ver.bestSan)}</span></h4>` +
+      html += `<div class="better"><h4>What <span class="mono">${escapeHtml(ver.bestSan)}</span> would have done</h4>` +
               `<p>${escapeHtml(ver.bestNote || '')}</p></div>`;
     }
   } else {
     html += `<p class="hint">Engine hasn't reached this move yet.</p>`;
   }
   el.innerHTML = html;
+}
+
+/* ---------------------------------------------------------------------------
+   THE PLAN TAB
+   Reads the position on the board right now and says what each side should be
+   working toward. Independent of the engine, so it is there instantly and works
+   just as well in the free board.
+   --------------------------------------------------------------------------- */
+function renderPlan(){
+  const el = $('panel-plan');
+  if(!el) return;
+  const v = view();
+  const pos = posFromFen(v.fens[v.ply]);
+  let r;
+  try{ r = Strategy.read(pos); }
+  catch(e){ el.innerHTML = `<p class="hint">Could not read this position.</p>`; return; }
+
+  const toMove = pos.turn === ChessEngine.WHITE ? 'White' : 'Black';
+  const PHASE = {opening:'Opening', middlegame:'Middlegame', endgame:'Endgame'};
+
+  let html = `<div class="plan-head"><span class="badge">${PHASE[r.phase]}</span>` +
+             `<span class="hint mono">${escapeHtml(toMove)} to move</span></div>`;
+
+  const cp = r.centrePlan;
+  if(cp){
+    html += `<h3>${escapeHtml(cp.name)}</h3><p class="say">${escapeHtml(cp.what)}</p>`;
+    if(cp.both){
+      html += `<p class="say">${escapeHtml(cp.both)}</p>`;
+    } else if(r.centre.owner !== null && r.centre.owner !== undefined){
+      const ownerName = r.centre.owner === ChessEngine.WHITE ? 'White' : 'Black';
+      const otherName = r.centre.owner === ChessEngine.WHITE ? 'Black' : 'White';
+      html += `<div class="struct-plans">` +
+              `<div class="sp sp-w"><span class="sp-t">${escapeHtml(ownerName)}</span><p>${escapeHtml(cp.owner)}</p></div>` +
+              `<div class="sp sp-b"><span class="sp-t">${escapeHtml(otherName)}</span><p>${escapeHtml(cp.other)}</p></div>` +
+              `</div>`;
+    }
+  }
+
+  const forSide = side => r.notes.filter(n => n.side === side);
+  const shared  = r.notes.filter(n => n.side === null);
+
+  if(shared.length){
+    html += `<h3 style="margin-top:1.1rem">What matters in this position</h3><ul class="plan-list">` +
+            shared.slice(0,3).map(n => `<li>${escapeHtml(n.text)}</li>`).join('') + `</ul>`;
+  }
+  for(const [side, label] of [[ChessEngine.WHITE,'White'],[ChessEngine.BLACK,'Black']]){
+    const mine = forSide(side).slice(0, 4);
+    if(!mine.length) continue;
+    html += `<h3 style="margin-top:1rem">${label}'s long-term plan</h3><ul class="plan-list">` +
+            mine.map(n => `<li>${escapeHtml(n.text)}</li>`).join('') + `</ul>`;
+  }
+  if(!shared.length && !forSide(ChessEngine.WHITE).length && !forSide(ChessEngine.BLACK).length)
+    html += `<p class="hint">Nothing has settled yet — no weak pawns, no open files, both kings fine. Develop, castle, and let the position declare itself.</p>`;
+
+  html += `<p class="hint" style="margin-top:1rem">This reads the position on the board, not an opening book — it updates as you step through the game.</p>`;
+  el.innerHTML = html;
+}
+
+function renderTabs(){
+  const el = $('tutorTabs');
+  if(!el) return;
+  el.innerHTML = [['move','This move'],['plan','The plan']]
+    .map(([k,label]) => `<button class="ttab${state.tab===k?' active':''}" data-tab="${k}">${label}</button>`).join('');
+  // The shared stylesheet hides .tpanel and shows .tpanel.active, so the class
+  // is what actually switches panels; `hidden` is set too so the state is
+  // legible to assistive tech and to tests.
+  for(const [id, key] of [['panel-move','move'], ['panel-plan','plan']]){
+    const el = $(id);
+    el.classList.toggle('active', state.tab === key);
+    el.hidden = state.tab !== key;
+  }
 }
 
 function renderControls(){
@@ -2122,6 +2761,10 @@ function wire(){
   $('btnFlip').addEventListener('click', () => { state.flipped = !state.flipped; renderBoard(); });
   $('btnLoad').addEventListener('click', () => loadGame($('pgnInput').value));
   $('btnSample').addEventListener('click', () => { $('pgnInput').value = SAMPLE_PGN; loadGame(SAMPLE_PGN); });
+  $('tutorTabs').addEventListener('click', e => {
+    const b = e.target.closest('[data-tab]'); if(!b) return;
+    state.tab = b.dataset.tab; renderTabs();
+  });
   $('btnEngineHere').addEventListener('click', askEngineHere);
   $('btnResetFree').addEventListener('click', () => {
     state.free = {sans:[], fens:[ChessEngine.START], selected:null, targets:[], promo:null, thinking:false, engineLines:null};

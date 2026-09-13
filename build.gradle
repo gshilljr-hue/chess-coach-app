@@ -1,0 +1,5 @@
+// Top-level build file. The Android Gradle Plugin version here is the one thing
+// most likely to need bumping if you come back to this project in a year or two.
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}

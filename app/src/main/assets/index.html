@@ -395,6 +395,30 @@
 .why.v-mistake{border-left-color:#D9843C}
 .why.v-blunder,.why.v-missed{border-left-color:#B44A50}
 .why-alt{display:block;margin-top:.5rem;color:var(--ink-soft)}
+/* ---- reading a position off a picture ---- */
+.drop{border:1.5px dashed var(--rule,#C9C0A4);border-radius:12px;padding:.9rem .85rem;
+  background:var(--panel);text-align:left}
+.drop.over{border-color:var(--brass);background:var(--brass-tint)}
+.drop-head{margin:0 0 .6rem;font-size:.98rem}
+.drop .hint{margin:.6rem 0 0}
+#scanStatus:empty{display:none}
+#scanStatus{margin-top:.6rem}
+.scan-block{margin-top:.85rem}
+.scan-block h4{margin:0 0 .4rem;font-size:.86rem;font-weight:600;color:var(--ink-soft)}
+.seg{display:flex;gap:0;border:1.5px solid var(--paper-2);border-radius:999px;overflow:hidden;width:max-content;max-width:100%}
+.seg button{appearance:none;border:0;background:transparent;color:var(--ink-soft);
+  padding:.5rem 1.1rem;font:inherit;font-weight:600;cursor:pointer}
+.seg button.on{background:var(--brass);color:#FFF8E6}
+.palette{display:grid;grid-template-columns:repeat(7,1fr);gap:5px;max-width:420px}
+.pal{appearance:none;border:1.5px solid var(--paper-2);background:var(--panel);border-radius:9px;
+  aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:3px}
+.pal.on{border-color:var(--brass);background:var(--brass-tint);box-shadow:0 0 0 2px var(--brass-tint)}
+.pal svg{width:100%;height:100%}
+.pal.erase{font-size:.72rem;font-weight:600;color:var(--ink-soft);line-height:1.1;text-align:center}
+.checks{display:flex;gap:.75rem;flex-wrap:wrap;font-size:.9rem}
+.checks label{display:flex;align-items:center;gap:.3rem;cursor:pointer}
+.sq.armed{outline:2px solid var(--brass);outline-offset:-2px}
+.scan-note{font-size:.88rem;color:var(--ink-soft);margin:.5rem 0 0;line-height:1.5}
 .plan-head{display:flex;align-items:center;gap:.6rem;margin-bottom:.5rem}
 #panel-plan h3{font-size:1rem;margin:.2rem 0 .3rem}
 #panel-plan .plan-list li{margin-bottom:.45rem;line-height:1.55}
@@ -475,6 +499,18 @@
         <div id="progress" hidden></div>
       </div>
 
+      <div id="scanInput" hidden>
+        <div class="drop" id="dropZone">
+          <p class="drop-head"><b>Paste a screenshot</b> of a chessboard, or drop one here.</p>
+          <div class="pgn-actions">
+            <button class="btn" id="btnPickImage">Choose a picture</button>
+            <input type="file" id="fileImage" accept="image/*" hidden>
+          </div>
+          <p class="hint">Any flat, square-on picture of a board works — this app, another app, a diagram from a book. The position is read off the picture and you get to correct it before anything is analysed.</p>
+        </div>
+        <div id="scanStatus"></div>
+      </div>
+
       <div class="board-wrap"><div class="board" id="board"></div></div>
       <div class="promo-bar" id="promoBar" hidden></div>
       <div class="history-ribbon" id="ribbon"></div>
@@ -487,6 +523,27 @@
       <div id="freeTools" class="controls" hidden>
         <button class="btn" id="btnEngineHere">What does the engine think?</button>
         <button class="btn ghost" id="btnResetFree">Reset board</button>
+      </div>
+
+      <div id="scanEdit" hidden>
+        <div class="scan-block">
+          <h4>Whose move is it?</h4>
+          <div class="seg" id="turnRow"></div>
+        </div>
+        <div class="scan-block">
+          <h4>Anything read wrong? Tap a piece, then tap the square.</h4>
+          <div class="palette" id="palette"></div>
+        </div>
+        <div class="scan-block" id="castleBlock">
+          <h4>Castling still allowed</h4>
+          <div class="checks" id="castleRow"></div>
+        </div>
+        <div class="pgn-actions">
+          <button class="btn" id="btnAnalyseScan">Analyse this position</button>
+          <button class="btn ghost" id="btnScanFlip">Turn the board round</button>
+          <button class="btn ghost" id="btnScanSwap">Swap the colours</button>
+          <button class="btn ghost" id="btnScanAgain">Different picture</button>
+        </div>
       </div>
     </div>
 
@@ -1796,6 +1853,1185 @@ return {read, phase, centre, files, majorities, outposts, bishopQuality, shelter
 
 </script>
 <script>
+/* vision.js — reading a chess position out of a screenshot.
+
+   The job in three stages:
+
+     1. Find the board.  A chessboard has a signature no other part of a UI has:
+        an 8x8 grid whose squares alternate between exactly two colours. We find
+        the grid spacing from the periodic edge structure, then confirm the
+        winner by checking that the alternation actually holds.
+
+     2. Cut out 64 squares and decide, for each, empty or occupied, and if
+        occupied, which colour. Both of those are decided *relative to this
+        screenshot* rather than against absolute thresholds, so an unusual
+        board palette or a dark-mode app does not break them.
+
+     3. Name the piece on each occupied square. This is the hard part and the
+        one place the app can be wrong, so it leans on two things that make it
+        much harder to be wrong: pieces repeat within a single screenshot and
+        identical pieces render identically, so squares are clustered and a
+        whole cluster is named at once; and the rules of chess forbid most of
+        the ways a classifier can fail — two white kings, nine black pawns, a
+        pawn on the first rank — so the result is repaired against them.
+
+   Everything here is deliberately style-agnostic: no assumption that the board
+   is green, that the pieces are Staunton, or that light is at the bottom. What
+   it does assume is a screenshot rather than a photograph — square, axis-aligned
+   and unwarped. The user confirms the reading on an editable board before
+   anything is analysed, which is the real safety net.
+*/
+const Vision = (function(){
+'use strict';
+
+const TYPES = ['K','Q','R','B','N','P'];
+const NORM = 24;                 // shape descriptors live on a NORM x NORM grid
+
+/* ---------------------------------------------------------------- plumbing */
+
+function drawToCanvas(src, maxDim){
+  const sw = src.naturalWidth || src.videoWidth || src.width;
+  const sh = src.naturalHeight || src.videoHeight || src.height;
+  const scale = maxDim ? Math.min(1, maxDim / Math.max(sw, sh)) : 1;
+  const w = Math.max(1, Math.round(sw * scale));
+  const h = Math.max(1, Math.round(sh * scale));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d', {willReadFrequently: true});
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(src, 0, 0, w, h);
+  return {canvas: c, ctx, w, h, scale, data: ctx.getImageData(0, 0, w, h)};
+}
+
+function lumaOf(d){
+  const n = d.width * d.height, out = new Float32Array(n), p = d.data;
+  for(let i = 0; i < n; i++){
+    out[i] = (0.299 * p[i*4] + 0.587 * p[i*4+1] + 0.114 * p[i*4+2]) / 255;
+  }
+  return out;
+}
+
+/* Summed-area table, so the mean of any rectangle is four lookups. */
+function integral(g, w, h){
+  const I = new Float64Array((w+1) * (h+1));
+  for(let y = 0; y < h; y++){
+    let run = 0;
+    for(let x = 0; x < w; x++){
+      run += g[y*w + x];
+      I[(y+1)*(w+1) + (x+1)] = I[y*(w+1) + (x+1)] + run;
+    }
+  }
+  return I;
+}
+
+/* Mean of the half-open rectangle [x0,x1) x [y0,y1), clipped to the image. */
+function rectMean(I, w, h, x0, y0, x1, y1){
+  x0 = Math.max(0, Math.min(w, Math.round(x0)));
+  x1 = Math.max(0, Math.min(w, Math.round(x1)));
+  y0 = Math.max(0, Math.min(h, Math.round(y0)));
+  y1 = Math.max(0, Math.min(h, Math.round(y1)));
+  const aw = x1 - x0, ah = y1 - y0;
+  if(aw <= 0 || ah <= 0) return 0;
+  const W = w + 1;
+  const s = I[y1*W + x1] - I[y0*W + x1] - I[y1*W + x0] + I[y0*W + x0];
+  return s / (aw * ah);
+}
+
+function median(a){
+  if(!a.length) return 0;
+  const b = Float64Array.from(a).sort();
+  const m = b.length >> 1;
+  return b.length % 2 ? b[m] : (b[m-1] + b[m]) / 2;
+}
+function medianAbsDev(a, med){
+  if(!a.length) return 0;
+  return median(a.map(v => Math.abs(v - med)));
+}
+
+/* ------------------------------------------------------- finding the board */
+
+/* Per-column and per-row edge energy. Grid lines between squares show up here
+   as evenly spaced peaks; that spacing is the square size we are looking for. */
+/* What matters about a grid line is not that it is a strong edge but that it is
+   an edge nearly all the way down. Every piece in a set is drawn at the same
+   place in its square, so piece outlines also repeat at exactly the square
+   spacing — and if we simply added up gradient magnitudes, a bright piece set
+   on a dark board would out-shout the grid and put the whole search half a
+   square out. Counting how many rows carry an edge fixes that: a grid line
+   scores at almost every row, the curve of a bishop's shoulder at very few. */
+function edgeProfiles(g, w, h, band){
+  const Ex = new Float64Array(w), Ey = new Float64Array(h);
+  const ya = band ? Math.max(1, Math.floor(band.y0)) : 1;
+  const yb = band ? Math.min(h-1, Math.ceil(band.y1)) : h - 1;
+  const xa = band ? Math.max(1, Math.floor(band.x0)) : 1;
+  const xb = band ? Math.min(w-1, Math.ceil(band.x1)) : w - 1;
+  if(yb <= ya || xb <= xa) return {Ex, Ey};
+
+  // A threshold from the image itself, so this works on faint and vivid boards.
+  const sample = [];
+  for(let y = ya; y < yb; y += 3) for(let x = xa; x < xb; x += 3){
+    const i = y*w + x;
+    sample.push(Math.abs(g[i+1] - g[i-1]));
+  }
+  sample.sort((a, b) => a - b);
+  const p85 = sample.length ? sample[Math.floor(sample.length * 0.85)] : 0;
+  const t = Math.max(0.025, 0.40 * p85);
+
+  for(let y = ya; y < yb; y++){
+    for(let x = xa; x < xb; x++){
+      const i = y*w + x;
+      if(Math.abs(g[i+1] - g[i-1]) > t) Ex[x]++;
+      if(Math.abs(g[i+w] - g[i-w]) > t) Ey[y]++;
+    }
+  }
+  const flatten = (E, n) => {
+    const med = median(Array.from(E));
+    let max = 0;
+    for(let i = 0; i < n; i++){ E[i] = Math.max(0, E[i] - med); if(E[i] > max) max = E[i]; }
+    if(max > 0) for(let i = 0; i < n; i++) E[i] /= max;
+  };
+  flatten(Ex, w); flatten(Ey, h);
+  return {Ex, Ey};
+}
+
+/* For one candidate square size, the phase whose comb of grid lines collects
+   the most edge energy. Scored as a mean, not a sum: a comb at half the true
+   spacing lands half its teeth inside squares and its mean collapses, which is
+   what stops the search locking onto a harmonic. */
+function bestPhase(E, n, s){
+  let best = {score: -1, phase: 0, lines: 0};
+  const step = 1;
+  for(let p = 0; p < s; p += step){
+    let sum = 0, cnt = 0;
+    for(let x = p; x < n; x += s){
+      const xi = Math.round(x);
+      if(xi >= 0 && xi < n){ sum += E[xi]; cnt++; }
+    }
+    if(cnt < 9) continue;
+    const score = (sum / cnt) * Math.min(1, cnt / 9);
+    if(score > best.score) best = {score, phase: p, lines: cnt};
+  }
+  return best;
+}
+
+/* Does the 8x8 window starting at (x0,y0) actually alternate?
+
+   Only the four corner patches of each square are sampled. Pieces are drawn
+   centred and essentially never reach the corners, so this measures the board
+   underneath rather than what is standing on it, and taking the median of the
+   four survives a coordinate label sitting in one of them. */
+/* Median of exactly four numbers, without building an array to sort. This runs
+   once per square of every candidate window — hundreds of thousands of times
+   for one screenshot — and doing it the obvious way costs more than the rest of
+   the search put together. */
+function med4(a, b, c, d){
+  const lo1 = a < b ? a : b, hi1 = a < b ? b : a;
+  const lo2 = c < d ? c : d, hi2 = c < d ? d : c;
+  const mid1 = lo1 > lo2 ? lo1 : lo2;
+  const mid2 = hi1 < hi2 ? hi1 : hi2;
+  return (mid1 + mid2) / 2;
+}
+
+const SCRATCH64 = new Float64Array(64);
+
+function cornerMedians(I, w, h, x0, y0, s, v, r0, r1, c0, c1){
+  const q = s * 0.18;
+  const a = s * 0.04, z = s * 0.96;
+  for(let r = r0; r < r1; r++){
+    for(let c = c0; c < c1; c++){
+      const sx = x0 + c*s, sy = y0 + r*s;
+      v[r*8 + c] = med4(
+        rectMean(I, w, h, sx + a,     sy + a,     sx + a + q, sy + a + q),
+        rectMean(I, w, h, sx + z - q, sy + a,     sx + z,     sy + a + q),
+        rectMean(I, w, h, sx + a,     sy + z - q, sx + a + q, sy + z),
+        rectMean(I, w, h, sx + z - q, sy + z - q, sx + z,     sy + z));
+    }
+  }
+}
+
+function checkerScore(I, w, h, x0, y0, s){
+  const v = SCRATCH64;
+
+  /* Nearly every window tried is not a chessboard, so look at a quarter of it
+     first and give up early if that quarter already fails to alternate. */
+  cornerMedians(I, w, h, x0, y0, s, v, 0, 4, 0, 4);
+  let qlo = Infinity, qhi = -Infinity;
+  for(let r = 0; r < 4; r++) for(let c = 0; c < 4; c++){
+    const t = v[r*8 + c];
+    if(t < qlo) qlo = t;
+    if(t > qhi) qhi = t;
+  }
+  if(qhi - qlo < 0.02) return {agree: 0, spread: 0, score: -1, light: qhi, dark: qlo, lightIsEven: true};
+  const qmid = (qlo + qhi) / 2;
+  let qAgree = 0;
+  for(let r = 0; r < 4; r++) for(let c = 0; c < 4; c++){
+    if(((r + c) % 2 === 0) === (v[r*8 + c] > qmid)) qAgree++;
+  }
+  if(qAgree < 12 && qAgree > 4) return {agree: 0, spread: 0, score: -1, light: qhi, dark: qlo, lightIsEven: true};
+
+  cornerMedians(I, w, h, x0, y0, s, v, 0, 8, 4, 8);
+  cornerMedians(I, w, h, x0, y0, s, v, 4, 8, 0, 4);
+
+  const even = [], odd = [];
+  for(let i = 0; i < 64; i++) ((Math.floor(i/8) + i%8) % 2 === 0 ? even : odd).push(v[i]);
+  const me = median(even), mo = median(odd);
+  const lightIsEven = me > mo;
+  const light = lightIsEven ? even : odd;
+  const dark  = lightIsEven ? odd  : even;
+  const L = median(light), D = median(dark);
+
+  /* The decisive test, and the reason this does not lock onto anything else in
+     a screenshot that happens to repeat: does every single square fall on the
+     side of the midpoint its parity says it should? A comb at a third of the
+     true spacing samples three cells inside one real square and agreement
+     collapses to chance; a window sliding off the edge of the board fails on
+     the rows that are no longer board. */
+  const mid = (L + D) / 2;
+  let agree = 0;
+  for(let i = 0; i < 64; i++){
+    const shouldBeLight = ((Math.floor(i/8) + i%8) % 2 === 0) === lightIsEven;
+    if((v[i] > mid) === shouldBeLight) agree++;
+  }
+  const a = agree / 64;
+  const spread = L - D;
+  const noise = medianAbsDev(light, L) + medianAbsDev(dark, D);
+  return {agree: a, spread, light: L, dark: D, lightIsEven,
+          score: spread * Math.pow(a, 8) - 0.5 * noise};
+}
+
+/* Stage 1 proper: search spacings, keep the plausible ones, and let the
+   alternation test pick the winner. Every spacing gets tried rather than a
+   shortlist by edge energy — a dark-mode board whose edges are faint still has
+   a perfect alternation, and shortlisting on edges alone used to lose it. */
+function findGrid(g, w, h){
+  const {Ex, Ey} = edgeProfiles(g, w, h);
+  const I = integral(g, w, h);
+
+  const maxS = Math.floor(Math.min(w, h) / 8);
+  // Below about a dozen pixels a square holds too little to name the piece on
+  // it, so there is nothing to gain by searching down there.
+  if(maxS < 12) return null;
+
+  const cands = [];
+  for(let s = 12; s <= maxS; s += Math.max(0.25, s * 0.012)){
+    const px = bestPhase(Ex, w, s), py = bestPhase(Ey, h, s);
+    if(px.score < 0 || py.score < 0) continue;
+    cands.push({s, px, py, comb: px.score + py.score});
+  }
+  if(!cands.length) return null;
+
+  let best = null;
+  for(const c of cands){
+    const s = c.s;
+    // Which run of eight consecutive squares is the board? The window has to
+    // sit inside the image — a board that runs off the edge is not one we can
+    // read anyway, and allowing it lets partial matches win.
+    for(let ix = 0; ; ix++){
+      const x0 = c.px.phase + ix * s;
+      if(x0 + 8*s > w + 1) break;
+      for(let iy = 0; ; iy++){
+        const y0 = c.py.phase + iy * s;
+        if(y0 + 8*s > h + 1) break;
+        const cs = checkerScore(I, w, h, x0, y0, s);
+        // A real board separates its two colours and does it on all 64 squares.
+        if(cs.spread < 0.03 || cs.agree < 0.90) continue;
+        const score = cs.score + 0.10 * c.comb + 0.10 * (s / maxS);
+        if(!best || score > best.score){
+          best = {score, x0, y0, s, ...cs};
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/* How badly does a candidate grid disagree with the chequering, measured with
+   patches that run right into the corners of each square?
+
+   The point of hugging the corners is sensitivity. A grid that is a few pixels
+   out, or whose spacing is a per-cent short, pulls the neighbouring square's
+   colour into the patch and the error climbs immediately — whereas patches
+   sitting safely in the middle of each square barely notice. This is what pins
+   the grid down to the pixel. */
+function alignError(I, w, h, x0, y0, s, L, D){
+  const q = s * 0.26;
+  let err = 0;
+  for(let r = 0; r < 8; r++){
+    for(let c = 0; c < 8; c++){
+      const sx = x0 + c*s, sy = y0 + r*s;
+      const want = ((r + c) % 2 === 0) ? L : D;
+      const vs = [
+        rectMean(I, w, h, sx,     sy,     sx + q, sy + q),
+        rectMean(I, w, h, sx+s-q, sy,     sx + s, sy + q),
+        rectMean(I, w, h, sx,     sy+s-q, sx + q, sy + s),
+        rectMean(I, w, h, sx+s-q, sy+s-q, sx + s, sy + s),
+      ];
+      for(const v of vs){ const d = v - want; err += d * d; }
+    }
+  }
+  return err;
+}
+
+/* Estimate the two square colours for a given grid, from patches kept well
+   clear of the corners so a slightly-off grid still reads them correctly. */
+function squareColours(I, w, h, x0, y0, s){
+  const even = [], odd = [];
+  const a = s * 0.30, b = s * 0.70;
+  for(let r = 0; r < 8; r++) for(let c = 0; c < 8; c++){
+    const sx = x0 + c*s, sy = y0 + r*s;
+    // Two slivers along the top and left, which pieces reach least often.
+    const v = median([
+      rectMean(I, w, h, sx + a, sy + s*0.03, sx + b, sy + s*0.13),
+      rectMean(I, w, h, sx + s*0.03, sy + a, sx + s*0.13, sy + b),
+    ]);
+    ((r + c) % 2 === 0 ? even : odd).push(v);
+  }
+  return {L: median(even), D: median(odd)};
+}
+
+/* Once we know roughly where the grid is, pin it down. Coordinate descent on
+   the alignment error: nudge the left edge, then the top edge, then the
+   spacing, and go round again. A pixel of slop at search resolution is several
+   pixels at full size, which is enough to slice the top off every piece. */
+function refineGrid(g, w, h, grid){
+  const I = integral(g, w, h);
+  let {x0, y0, s} = grid;
+
+  for(let round = 0; round < 4; round++){
+    const {L, D} = squareColours(I, w, h, x0, y0, s);
+    const at = (X, Y, S) => alignError(I, w, h, X, Y, S, L, D);
+    const span = round === 0 ? 0.40 : 0.10;
+    const sstep = Math.max(0.05, s * 0.0015);
+
+    let bestS = s, bestE = at(x0, y0, s);
+    for(let t = s * (1 - span/3); t <= s * (1 + span/3); t += sstep){
+      const e = at(x0, y0, t);
+      if(e < bestE){ bestE = e; bestS = t; }
+    }
+    s = bestS;
+
+    let bestX = x0; bestE = at(x0, y0, s);
+    for(let t = x0 - s*span; t <= x0 + s*span; t += 0.25){
+      const e = at(t, y0, s);
+      if(e < bestE){ bestE = e; bestX = t; }
+    }
+    x0 = bestX;
+
+    let bestY = y0; bestE = at(x0, y0, s);
+    for(let t = y0 - s*span; t <= y0 + s*span; t += 0.25){
+      const e = at(x0, t, s);
+      if(e < bestE){ bestE = e; bestY = t; }
+    }
+    y0 = bestY;
+  }
+
+  const {L, D} = squareColours(I, w, h, x0, y0, s);
+  return {...grid, x0, y0, s, light: Math.max(L, D), dark: Math.min(L, D)};
+}
+
+/* ------------------------------------------------ one square, pulled apart */
+
+/* Connected components on a binary mask, 4-connected, iterative so a big
+   square cannot blow the stack. */
+function components(mask, w, h){
+  const label = new Int32Array(w*h).fill(-1);
+  const comps = [];
+  const stack = [];
+  for(let i = 0; i < w*h; i++){
+    if(!mask[i] || label[i] >= 0) continue;
+    const id = comps.length;
+    const comp = {id, area: 0, minx: w, maxx: -1, miny: h, maxy: -1, touchesEdge: false, seed: i};
+    stack.push(i); label[i] = id;
+    while(stack.length){
+      const p = stack.pop();
+      const x = p % w, y = (p - x) / w;
+      comp.area++;
+      if(x < comp.minx) comp.minx = x;
+      if(x > comp.maxx) comp.maxx = x;
+      if(y < comp.miny) comp.miny = y;
+      if(y > comp.maxy) comp.maxy = y;
+      if(x === 0 || y === 0 || x === w-1 || y === h-1) comp.touchesEdge = true;
+      if(x > 0   && mask[p-1] && label[p-1] < 0){ label[p-1] = id; stack.push(p-1); }
+      if(x < w-1 && mask[p+1] && label[p+1] < 0){ label[p+1] = id; stack.push(p+1); }
+      if(y > 0   && mask[p-w] && label[p-w] < 0){ label[p-w] = id; stack.push(p-w); }
+      if(y < h-1 && mask[p+w] && label[p+w] < 0){ label[p+w] = id; stack.push(p+w); }
+    }
+    comps.push(comp);
+  }
+  return {label, comps};
+}
+
+/* Turn an outline into a silhouette. Many piece sets draw a white piece as a
+   white body with a dark outline; against a light square only the outline
+   survives thresholding, leaving a ring. Filling every hole that does not reach
+   the border turns that ring back into the shape it was drawing. Also returns
+   how many holes there were, which is itself a useful clue. */
+function fillHoles(mask, w, h){
+  const inv = new Uint8Array(w*h);
+  for(let i = 0; i < w*h; i++) inv[i] = mask[i] ? 0 : 1;
+  const {comps, label} = components(inv, w, h);
+  let holes = 0;
+  const fillIt = new Uint8Array(comps.length);
+  for(const c of comps){
+    if(c.touchesEdge || c.area < 3) continue;
+    fillIt[c.id] = 1;
+    holes++;
+  }
+  const filled = Uint8Array.from(mask);
+  if(holes){
+    for(let i = 0; i < w*h; i++){
+      const L = label[i];
+      if(L >= 0 && fillIt[L]) filled[i] = 1;
+    }
+  }
+  return {filled, holes};
+}
+
+/* Everything we can learn about one square of the board. */
+function readSquare(img, grid, r, c, opts){
+  const {data, w: iw, h: ih} = img;
+  const px = data.data;
+  const s = grid.s;
+  const inset = s * 0.045;                  // stay off the grid line
+  const x0 = Math.round(grid.x0 + c*s + inset);
+  const y0 = Math.round(grid.y0 + r*s + inset);
+  const x1 = Math.round(grid.x0 + (c+1)*s - inset);
+  const y1 = Math.round(grid.y0 + (r+1)*s - inset);
+  const w = Math.max(1, Math.min(iw, x1) - Math.max(0, x0));
+  const h = Math.max(1, Math.min(ih, y1) - Math.max(0, y0));
+  const ox = Math.max(0, x0), oy = Math.max(0, y0);
+
+  const at = (x, y) => { const i = ((oy+y)*iw + (ox+x)) * 4; return [px[i], px[i+1], px[i+2]]; };
+
+  /* Background: the median of the four corner patches, which is what the square
+     itself looks like even when it is tinted by a last-move highlight. */
+  const q = Math.max(1, Math.round(Math.min(w, h) * 0.17));
+  const patch = (sx, sy) => {
+    const rs = [], gs = [], bs = [];
+    for(let y = sy; y < sy + q; y++) for(let x = sx; x < sx + q; x++){
+      if(x < 0 || y < 0 || x >= w || y >= h) continue;
+      const v = at(x, y); rs.push(v[0]); gs.push(v[1]); bs.push(v[2]);
+    }
+    return [median(rs), median(gs), median(bs)];
+  };
+  const cornerBoxes = [[0,0], [w-q,0], [0,h-q], [w-q,h-q]];
+  const corners = cornerBoxes.map(([sx, sy]) => patch(sx, sy));
+  const bg = [0,1,2].map(k => median(corners.map(cc => cc[k])));
+  const bgLum = (0.299*bg[0] + 0.587*bg[1] + 0.114*bg[2]) / 255;
+
+  const dist = (v) => Math.max(Math.abs(v[0]-bg[0]), Math.abs(v[1]-bg[1]), Math.abs(v[2]-bg[2]));
+
+  /* Where to draw the line between "this is the square" and "this is a piece".
+
+     A fixed threshold, or one scaled to the board's overall contrast, quietly
+     ruins everything downstream: a white piece on a light square differs from
+     its square by far less than the same piece on a dark one, so the same piece
+     comes out as a solid shape in one place and a bare outline in another, and
+     nothing that compares shapes can work. So the threshold is measured instead
+     — from the corners of this very square, which are known to be empty. Once
+     we know how far a background pixel strays here, anything well beyond that
+     is a piece, whatever the palette.
+
+     Taking the median across the four corners is what survives a rank or file
+     label printed in one of them. */
+  const cornerNoise = cornerBoxes.map(([sx, sy]) => {
+    const ds = [];
+    for(let y = sy; y < sy + q; y++) for(let x = sx; x < sx + q; x++){
+      if(x < 0 || y < 0 || x >= w || y >= h) continue;
+      ds.push(dist(at(x, y)));
+    }
+    ds.sort((a, b) => a - b);
+    return ds.length ? ds[Math.floor(ds.length * 0.90)] : 0;
+  });
+  const T = Math.max(10, Math.min(60, 3.0 * median(cornerNoise)));
+
+  const raw = new Uint8Array(w*h);
+  const lum = new Float32Array(w*h);
+  for(let y = 0; y < h; y++) for(let x = 0; x < w; x++){
+    const v = at(x, y);
+    raw[y*w + x] = dist(v) > T ? 1 : 0;
+    lum[y*w + x] = (0.299*v[0] + 0.587*v[1] + 0.114*v[2]) / 255;
+  }
+
+  const {comps, label} = components(raw, w, h);
+  if(!comps.length) return {empty: true, bgLum, bg};
+  comps.sort((a, b) => b.area - a.area);
+  const main = comps[0];
+
+  /* Keep the biggest blob, plus any other blob of real size that sits clear of
+     the border — a knight's separate eye dot, say. Small border-hugging blobs
+     are rank and file labels and go. */
+  const keepComp = new Uint8Array(comps.length);
+  for(const comp of comps){
+    if(comp === main || (!comp.touchesEdge && comp.area > main.area * 0.06)) keepComp[comp.id] = 1;
+  }
+  const keep = new Uint8Array(w*h);
+  for(let i = 0; i < w*h; i++){
+    const L = label[i];
+    if(L >= 0 && keepComp[L]) keep[i] = 1;
+  }
+
+  const {filled, holes} = fillHoles(keep, w, h);
+  let area = 0, minx = w, maxx = -1, miny = h, maxy = -1;
+  for(let y = 0; y < h; y++) for(let x = 0; x < w; x++){
+    if(!filled[y*w + x]) continue;
+    area++;
+    if(x < minx) minx = x; if(x > maxx) maxx = x;
+    if(y < miny) miny = y; if(y > maxy) maxy = y;
+  }
+  const cover = area / (w*h);
+  if(cover < 0.045 || maxx < 0) return {empty: true, bgLum, bg, cover};
+
+  /* Measuring the threshold from the square's own corners makes it small on a
+     flat empty square, which is right — but it also means a faint gradient
+     across an empty square could clear it and be reported as a piece. So what
+     was found has to be convincingly different from the square, not merely
+     different: a real piece stands out several times more than the noise the
+     threshold was built from. */
+  const fgDist = [];
+  for(let y = 0; y < h; y++) for(let x = 0; x < w; x++){
+    if(!keep[y*w + x]) continue;
+    const v = at(x, y);
+    fgDist.push(Math.max(Math.abs(v[0]-bg[0]), Math.abs(v[1]-bg[1]), Math.abs(v[2]-bg[2])));
+  }
+  const strength = median(fgDist);
+  if(strength < Math.max(20, T * 2.2)) return {empty: true, bgLum, bg, cover, strength};
+
+  /* What colour is the piece?
+
+     Measured over the ink itself — the pixels that actually differ from the
+     square — and not over the filled-in silhouette. Two reasons. A piece drawn
+     as an outline has nothing but square inside it, so the silhouette's middle
+     says what colour the square is rather than what colour the piece is. And on
+     a thin piece the body is a small part of a filled shape, so anything that
+     leans on the middle ends up reading the outline: in one font that inverts
+     the answer completely, making the black bishops read lighter than the white
+     ones. The median over the ink is dominated by the body, which is the thing
+     we actually want, and needs no eroding to get there.
+
+     lightFrac is the backstop for sets where the two body colours are close:
+     whatever the square underneath, a white piece puts most of its ink lighter
+     than that square and a black piece puts most of it darker. */
+  const bodyLum = [], inkLum = [];
+  let lighter = 0;
+  for(let y = 0; y < h; y++) for(let x = 0; x < w; x++){
+    const i = y*w + x;
+    if(filled[i]) bodyLum.push(lum[i]);
+    if(keep[i]){
+      inkLum.push(lum[i]);
+      if(lum[i] > bgLum) lighter++;
+    }
+  }
+
+  /* The deepest interior, found by eroding the silhouette until only its thick
+     middle is left. On a normally drawn set this is the purest reading of the
+     piece's own colour there is — no outline in it at all. On a thin or heavily
+     outlined one it can vanish, or be nothing but outline, which is why it is
+     not the only candidate. */
+  let core = [];
+  for(let er = Math.max(1, Math.round(Math.min(w,h) * 0.06)); er >= 1; er--){
+    core = [];
+    for(let y = er; y < h-er; y++) for(let x = er; x < w-er; x++){
+      if(!filled[y*w + x]) continue;
+      let ok = true;
+      for(let dy = -er; dy <= er && ok; dy++) for(let dx = -er; dx <= er; dx++){
+        if(!filled[(y+dy)*w + (x+dx)]){ ok = false; break; }
+      }
+      if(ok) core.push(lum[y*w + x]);
+    }
+    // Only back off when nothing at all survives. Eroding less to get a bigger
+    // sample would pull the outline back in, which is the one thing this
+    // measurement exists to keep out.
+    if(core.length) break;
+  }
+
+  const coreLum = core.length ? median(core) : median(bodyLum);
+  const fgLum = median(bodyLum);
+  const lightFrac = inkLum.length ? lighter / inkLum.length : 0.5;
+
+  return {
+    empty: false, bg, bgLum, fgLum, coreLum, lightFrac, cover, holes,
+    mask: filled, mw: w, mh: h,
+    box: {minx, miny, maxx, maxy},
+    norm: normalise(filled, w, minx, miny, maxx, maxy),
+    height: (maxy - miny + 1) / s,
+    width:  (maxx - minx + 1) / s,
+    fill:   area / ((maxx-minx+1) * (maxy-miny+1)),
+  };
+}
+
+/* Resample the silhouette's bounding box onto a fixed grid so two pieces can be
+   compared whatever size they were drawn at. */
+function normalise(mask, w, minx, miny, maxx, maxy){
+  const bw = maxx - minx + 1, bh = maxy - miny + 1;
+  const out = new Float32Array(NORM * NORM);
+  for(let ny = 0; ny < NORM; ny++){
+    const y0 = miny + Math.floor(ny * bh / NORM), y1 = Math.max(y0+1, miny + Math.floor((ny+1) * bh / NORM));
+    for(let nx = 0; nx < NORM; nx++){
+      const x0 = minx + Math.floor(nx * bw / NORM), x1 = Math.max(x0+1, minx + Math.floor((nx+1) * bw / NORM));
+      let on = 0, tot = 0;
+      for(let y = y0; y < y1; y++) for(let x = x0; x < x1; x++){ tot++; if(mask[y*w + x]) on++; }
+      out[ny*NORM + nx] = tot ? on / tot : 0;
+    }
+  }
+  return out;
+}
+
+/* --------------------------------------------------------- shape features */
+
+function describe(sq){
+  const n = sq.norm;
+  /* The width profile, sixteen slices from crown to base. This is where most of
+     the difference between pieces actually lives: a rook is a wide flat slab
+     all the way up, a king narrows to a finial, a queen spreads into points, a
+     pawn has a small head on a thin neck. */
+  const bands = [];
+  for(let k = 0; k < 16; k++){
+    const y0 = Math.floor(k * NORM / 16), y1 = Math.floor((k+1) * NORM / 16);
+    let sum = 0, cnt = 0;
+    for(let y = y0; y < Math.max(y0+1, y1); y++){
+      for(let x = 0; x < NORM; x++) sum += n[y*NORM + x];
+      cnt += NORM;
+    }
+    bands.push(cnt ? sum / cnt : 0);
+  }
+
+  let total = 0, asym = 0, cy = 0;
+  for(let y = 0; y < NORM; y++) for(let x = 0; x < NORM; x++){
+    const v = n[y*NORM + x];
+    total += v; cy += v * y;
+    asym += Math.abs(v - n[y*NORM + (NORM-1-x)]);
+  }
+  cy = total ? cy / total / (NORM-1) : 0.5;
+
+  // Runs across a row: crenellations on a rook, points on a crown, one stem.
+  const runsAt = y => {
+    let runs = 0, prev = 0;
+    for(let x = 0; x < NORM; x++){ const v = n[y*NORM + x] > 0.5 ? 1 : 0; if(v && !prev) runs++; prev = v; }
+    return runs;
+  };
+
+  // Where the piece is at its widest — low for a pawn standing on its base,
+  // higher for a queen whose crown is the broadest part of it.
+  let wide = 0, wideAt = 0;
+  for(let k = 0; k < 16; k++) if(bands[k] > wide){ wide = bands[k]; wideAt = k; }
+
+  return {
+    h: sq.height, w: sq.width, fill: sq.fill, holes: sq.holes,
+    cover: sq.cover, bands, asym: total ? asym / (2*total) : 0, cy,
+    runsTop: Math.max(runsAt(1), runsAt(2)),
+    runsUpper: Math.max(runsAt(4), runsAt(6)),
+    runsMid: runsAt(12),
+    wideAt: wideAt / 15,
+    topW: (bands[0] + bands[1]) / 2,
+    midW: (bands[7] + bands[8]) / 2,
+    botW: (bands[14] + bands[15]) / 2,
+    norm: n,
+  };
+}
+
+/* How alike are two silhouettes? Intersection over union on the normalised
+   grids. Two renders of the same piece from the same screenshot land near 1. */
+function iou(a, b){
+  let inter = 0, union = 0;
+  for(let i = 0; i < a.length; i++){
+    const x = a[i], y = b[i];
+    inter += Math.min(x, y); union += Math.max(x, y);
+  }
+  return union ? inter / union : 0;
+}
+
+/* ------------------------------------------------------------ naming them */
+
+/* The numbers a silhouette is judged on.
+
+   Most of them are relative to the other pieces in the same screenshot — how
+   tall is this against the tallest piece of its colour, how wide against the
+   widest — because absolute proportions are exactly what changes when someone
+   switches piece set, and relative ones mostly do not. A king is the tallest
+   thing on the board in every set ever drawn; a pawn is the shortest. */
+const FEATURES = [
+  'h', 'w', 'aspect', 'fill', 'asym', 'cy', 'cover', 'wideAt',
+  'relH', 'relW', 'relArea', 'spanH', 'medH', 'medW',
+  'topW', 'midW', 'botW',
+  'runsTop', 'runsUpper', 'runsMid', 'holes',
+  'b0','b1','b2','b3','b4','b5','b6','b7','b8','b9','b10','b11','b12','b13','b14','b15',
+];
+
+function featureVector(f, ctx){
+  const span = (ctx.maxH - ctx.minH) || 1;
+  return [
+    f.h, f.w,
+    f.h > 0 ? f.w / f.h : 1,
+    f.fill, f.asym, f.cy, f.cover, f.wideAt,
+    ctx.maxH ? f.h / ctx.maxH : 1,
+    ctx.maxW ? f.w / ctx.maxW : 1,
+    ctx.maxCover ? f.cover / ctx.maxCover : 1,
+    (f.h - ctx.minH) / span,
+    ctx.medH ? f.h / ctx.medH : 1,
+    ctx.medW ? f.w / ctx.medW : 1,
+    f.topW, f.midW, f.botW,
+    Math.min(f.runsTop, 5) / 5,
+    Math.min(f.runsUpper, 5) / 5,
+    Math.min(f.runsMid, 5) / 5,
+    Math.min(f.holes, 3) / 3,
+    ...f.bands,
+  ];
+}
+
+/* Scores for one silhouette, on a scale where bigger is better. These are
+   deliberately soft: the cluster vote and the rules of chess afterwards do more
+   work than any single square's opinion. */
+function typeScoresRules(f, ctx){
+  const rel = ctx.maxH > 0 ? f.h / ctx.maxH : 1;       // height against the tallest piece of this colour
+  const s = {K: 0, Q: 0, R: 0, B: 0, N: 0, P: 0};
+
+  // The knight is the only piece that is not left-right symmetric, and no
+  // amount of restyling changes that.
+  s.N += 14 * Math.max(0, f.asym - 0.06);
+  const symPenalty = Math.max(0, 0.16 - f.asym) * 6;
+  s.K += symPenalty; s.Q += symPenalty; s.R += symPenalty; s.B += symPenalty; s.P += symPenalty;
+
+  // Pawns are short and small; kings and queens are tall.
+  s.P += 5 * Math.max(0, 0.80 - rel) + 3 * Math.max(0, 0.62 - f.h);
+  s.K += 4 * Math.max(0, rel - 0.93);
+  s.Q += 3.2 * Math.max(0, rel - 0.88);
+  s.B += 2.2 * Math.max(0, rel - 0.80) - 2 * Math.max(0, 0.70 - rel);
+  s.R += 1.2 - 3 * Math.abs(rel - 0.80);
+  s.N += 1.0 - 2.5 * Math.abs(rel - 0.82);
+
+  // What the top of the piece looks like. A rook is a flat wide block, a queen
+  // a wide spread of points, a king a narrow finial, a pawn and bishop a small
+  // round head.
+  s.R += 4 * Math.max(0, f.topW - 0.45) + 1.5 * Math.max(0, f.fill - 0.55);
+  s.Q += 3 * Math.max(0, f.topW - 0.35) + 0.8 * Math.max(0, f.runsTop - 2);
+  s.K += 3 * Math.max(0, 0.30 - f.topW);
+  s.P += 3 * Math.max(0, 0.34 - f.topW);
+  s.B += 2.4 * Math.max(0, 0.34 - f.topW);
+
+  // A bishop's mitre usually carries a slit; a king's cross often encloses one.
+  if(f.holes >= 1){ s.B += 0.8; s.K += 0.5; s.P -= 0.4; }
+
+  // Rooks are boxy: their silhouette fills its bounding box far more than a
+  // piece with a narrow stem does.
+  s.R += 3 * Math.max(0, f.fill - 0.50);
+  s.P -= 2 * Math.max(0, f.fill - 0.60);
+  s.Q -= 1.2 * Math.max(0, f.fill - 0.62);
+
+  // Weight low in the frame means a wide base under a slim body.
+  s.P += 2 * Math.max(0, f.cy - 0.58);
+  s.R += 1.2 * Math.max(0, 0.56 - Math.abs(f.cy - 0.56));
+
+  return s;
+}
+
+/* The learned classifier. MODEL is fitted offline from thousands of rendered
+   squares across several unrelated piece sets (see test/train-classifier.py),
+   and validated by training on some sets and testing on one held back, so the
+   numbers below are not merely memorising the sets they came from.
+
+   If it is ever missing, the hand-written rules above still answer — worse, but
+   they answer. */
+let MODEL = null;
+
+function typeScores(f, ctx){
+  const x = featureVector(f, ctx);
+  // A model fitted against a different set of features would quietly produce
+  // nonsense, so check the shape rather than trusting it.
+  if(!MODEL || !MODEL.w || MODEL.w.length !== TYPES.length || MODEL.w[0].length !== x.length){
+    return typeScoresRules(f, ctx);
+  }
+  const out = {};
+  for(let c = 0; c < TYPES.length; c++){
+    let z = MODEL.b[c];
+    const row = MODEL.w[c];
+    for(let i = 0; i < x.length; i++) z += row[i] * ((x[i] - MODEL.mean[i]) / MODEL.sd[i]);
+    out[TYPES[c]] = z;
+  }
+  // Softmax, so the margin between first and second choice means something
+  // comparable from square to square.
+  let mx = -Infinity;
+  for(const t of TYPES) if(out[t] > mx) mx = out[t];
+  let sum = 0;
+  for(const t of TYPES){ out[t] = Math.exp(out[t] - mx); sum += out[t]; }
+  for(const t of TYPES) out[t] = out[t] / sum;
+  return out;
+}
+
+function setModel(m){ MODEL = m; }
+
+/* Group the squares of one colour into clusters of identical renders. */
+/* Two renders of the same piece in the same screenshot overlap at better than
+   0.93 once the silhouettes are extracted consistently; two different pieces
+   rarely reach 0.85. The line sits above both numbers on purpose — a piece that
+   fails to join its own cluster merely loses the benefit of the vote, whereas a
+   bishop that sneaks into the pawn cluster breaks the counting rules that make
+   the whole thing reliable. */
+function cluster(items){
+  const groups = [];
+  for(const it of items){
+    let hit = null, bestv = 0.90;
+    for(const g of groups){
+      const v = iou(it.f.norm, g.rep.norm);
+      if(v > bestv){ bestv = v; hit = g; }
+    }
+    if(hit) hit.members.push(it);
+    else groups.push({rep: it.f, members: [it]});
+  }
+  return groups;
+}
+
+/* Turn cluster scores into an actual assignment, under the rules of chess.
+
+   The constraints do a lot of the work: there is exactly one king a side, never
+   more than eight pawns, and a pawn cannot stand on the first or last rank.
+   Clusters are settled in order of how sure we are, and each choice narrows
+   what is left. */
+/* What the rest of this colour's pieces look like, which is what makes "tall"
+   and "wide" mean anything. Measured over distinct clusters rather than
+   squares, so eight identical pawns do not drag the median down to pawn. */
+function contextOf(groups){
+  let maxH = 0, maxW = 0, maxCover = 0, minH = Infinity;
+  const hs = [], ws = [];
+  for(const g of groups){
+    const f = g.rep || (g.members && g.members[0] && g.members[0].f);
+    if(!f) continue;
+    hs.push(f.h); ws.push(f.w);
+    for(const m of g.members){
+      if(m.f.h > maxH) maxH = m.f.h;
+      if(m.f.h < minH) minH = m.f.h;
+      if(m.f.w > maxW) maxW = m.f.w;
+      if(m.f.cover > maxCover) maxCover = m.f.cover;
+    }
+  }
+  if(!isFinite(minH)) minH = 0;
+  return {maxH, maxW, maxCover, minH, medH: median(hs) || 1, medW: median(ws) || 1};
+}
+
+function assign(groups, side){
+  const budget = {K: 1, Q: 9, R: 10, B: 10, N: 10, P: 8};
+  const ctx = contextOf(groups);
+  const scored = groups.map(g => {
+    // Work in log probability so a cluster is the product of its members'
+    // opinions and the hints below are honest odds rather than magic numbers.
+    const totals = {K:0, Q:0, R:0, B:0, N:0, P:0};
+    for(const m of g.members){
+      const s = typeScores(m.f, ctx);
+      for(const t of TYPES) totals[t] += Math.log(Math.max(1e-9, s[t]));
+    }
+    for(const t of TYPES) totals[t] /= g.members.length;
+
+    /* Counting settles some of these outright. A side starts with two each of
+       knight, bishop and rook and one each of queen and king, so five or more
+       pieces sharing one silhouette can only be pawns — and a pawn can never be
+       on a back row, which is the one thing that could make this wrong. This
+       overrules the classifier rather than nudging it: it is arithmetic, and
+       the classifier is a guess. */
+    const n = g.members.length;
+    const onBackRow = g.members.some(m => m.rank === 0 || m.rank === 7);
+    const mustBePawn = n >= 5 && !onBackRow;
+    if(n >= 3 && !onBackRow) totals.P += 2.0;
+    if(n === 1){ totals.K += 0.3; totals.Q += 0.2; }
+    return {g, totals, mustBePawn};
+  });
+
+  // Confidence = how far the best guess is clear of the runner-up.
+  const order = scored.map(s => {
+    const ranked = TYPES.slice().sort((a,b) => s.totals[b] - s.totals[a]);
+    return {...s, ranked, margin: s.totals[ranked[0]] - s.totals[ranked[1]]};
+  }).sort((a,b) => b.margin - a.margin);
+
+  const out = [];
+  for(const o of order){
+    if(o.mustBePawn){
+      budget.P -= o.g.members.length;
+      out.push({group: o.g, type: 'P', margin: Math.max(o.margin, 2)});
+      continue;
+    }
+    let pick = null;
+    for(const t of o.ranked){
+      const room = budget[t] - 0;
+      if(room <= 0) continue;
+      // Pawns cannot be on the back ranks, so a cluster that has a member there
+      // is not the pawn cluster.
+      if(t === 'P' && o.g.members.some(m => m.rank === 0 || m.rank === 7)) continue;
+      if(t === 'P' && o.g.members.length > budget.P) continue;
+      if(t === 'K' && o.g.members.length > 1) continue;
+      pick = t; break;
+    }
+    if(!pick) pick = o.ranked[0];
+    if(pick === 'K') budget.K -= o.g.members.length;
+    if(pick === 'P') budget.P -= o.g.members.length;
+    out.push({group: o.g, type: pick, margin: o.margin});
+  }
+
+  // Exactly one king. If nobody took it, promote the best candidate that could
+  // plausibly be one; if several did, keep the likeliest.
+  const kings = out.filter(o => o.type === 'K');
+  const kingCount = kings.reduce((a, o) => a + o.group.members.length, 0);
+  if(kingCount !== 1){
+    let best = null;
+    for(const o of out){
+      for(const m of o.group.members){
+        const sc = typeScores(m.f, ctx).K;
+        if(!best || sc > best.sc) best = {sc, m, o};
+      }
+    }
+    if(best){
+      for(const o of out) if(o.type === 'K') o.type = o.group.members.length >= 5 ? 'P' : 'Q';
+      best.m.forceType = 'K';
+    }
+  }
+
+  const result = new Map();
+  for(const o of out){
+    for(const m of o.group.members){
+      result.set(m.idx, {type: m.forceType || o.type, margin: o.margin, single: o.group.members.length});
+    }
+  }
+  // A forced king must not leave its cluster-mates as kings too.
+  return result;
+}
+
+/* -------------------------------------------------------------- top level */
+
+function orient(board){
+  /* Which way up is the screenshot?
+
+     First ask which reading is even possible: a pawn cannot stand on its own
+     back rank, so if one of the two orientations puts one there, it is the
+     wrong one. That settles it outright surprisingly often. Otherwise fall back
+     to where the pieces are — each side's men sit on that side's half of the
+     board far more often than not — and finally to white at the bottom, which
+     is how nearly every screenshot is taken. */
+  const pawnFault = flip => {
+    let bad = 0;
+    for(let r = 0; r < 8; r++) for(let c = 0; c < 8; c++){
+      const p = board[r*8 + c];
+      if(!p || p.toUpperCase() !== 'P') continue;
+      // rank index counted from White's side, given the orientation
+      const rank = flip ? r : 7 - r;
+      if(rank === 0 || rank === 7) bad++;
+    }
+    return bad;
+  };
+  const a = pawnFault(false), b = pawnFault(true);
+  if(a !== b) return a < b ? 'white-bottom' : 'black-bottom';
+
+  let bottom = 0, top = 0;
+  for(let r = 0; r < 8; r++){
+    for(let c = 0; c < 8; c++){
+      const p = board[r*8 + c];
+      if(!p) continue;
+      const isWhite = p === p.toUpperCase();
+      if(r >= 5) bottom += isWhite ? 1 : -1;
+      if(r <= 2) top += isWhite ? 1 : -1;
+    }
+  }
+  /* r = 0 is the TOP row of the image. White at the bottom means white pieces
+     concentrate in high r. A clear majority is needed to overturn the default,
+     because in a sparse endgame — two kings and a queen, say — which half of
+     the board the pieces happen to be standing on says nothing at all, and
+     white at the bottom is how almost every screenshot is taken. */
+  return (top - bottom) >= 3 ? 'black-bottom' : 'white-bottom';
+}
+
+function toFen(board, orientation, turn){
+  /* board is indexed [row*8+col] with row 0 at the top of the image. */
+  const grid = [];
+  for(let r = 0; r < 8; r++){
+    const row = [];
+    for(let c = 0; c < 8; c++) row.push(board[r*8 + c]);
+    grid.push(row);
+  }
+  if(orientation === 'black-bottom'){
+    grid.reverse();
+    for(const row of grid) row.reverse();
+  }
+  // grid[0] is now rank 8.
+  const rows = grid.map(row => {
+    let out = '', run = 0;
+    for(const p of row){
+      if(!p) run++;
+      else { if(run){ out += run; run = 0; } out += p; }
+    }
+    if(run) out += run;
+    return out;
+  });
+  const placement = rows.join('/');
+
+  const sqAt = (file, rank) => grid[7-rank][file];
+  let castle = '';
+  if(sqAt(4,0) === 'K'){
+    if(sqAt(7,0) === 'R') castle += 'K';
+    if(sqAt(0,0) === 'R') castle += 'Q';
+  }
+  if(sqAt(4,7) === 'k'){
+    if(sqAt(7,7) === 'r') castle += 'k';
+    if(sqAt(0,7) === 'r') castle += 'q';
+  }
+  return `${placement} ${turn} ${castle || '-'} - 0 1`;
+}
+
+/* Things that make a position impossible, said in words rather than thrown. */
+function problems(board){
+  const out = [];
+  const count = ch => board.filter(p => p === ch).length;
+  if(count('K') !== 1) out.push(count('K') === 0 ? 'no white king' : `${count('K')} white kings`);
+  if(count('k') !== 1) out.push(count('k') === 0 ? 'no black king' : `${count('k')} black kings`);
+  if(count('P') > 8) out.push(`${count('P')} white pawns`);
+  if(count('p') > 8) out.push(`${count('p')} black pawns`);
+  return out;
+}
+
+/* The whole pipeline. Hands back the board, the FEN, where it thinks the grid
+   was, and how sure it is per square so the confirm screen can flag the ones
+   worth a second look. */
+async function recognise(src, opts){
+  opts = opts || {};
+  const search = drawToCanvas(src, 560);
+  const gs = lumaOf(search.data);
+  let grid = findGrid(gs, search.w, search.h);
+  if(!grid) return {ok: false, reason: 'no-board'};
+
+  const full = drawToCanvas(src, 1200);
+  const k = full.w / search.w;
+  grid = refineGrid(lumaOf(full.data), full.w, full.h,
+                    {...grid, x0: grid.x0 * k, y0: grid.y0 * k, s: grid.s * k});
+
+  const contrast = Math.abs(grid.light - grid.dark);
+  const squares = [];
+  for(let r = 0; r < 8; r++)
+    for(let c = 0; c < 8; c++)
+      squares.push(readSquare(full, grid, r, c, {contrast}));
+
+  const occupied = squares.map((sq, i) => ({sq, i})).filter(o => !o.sq.empty);
+  if(occupied.length < 2) return {ok: false, reason: 'no-pieces', grid};
+
+  /* Piece colour, decided by splitting this screenshot's own pieces into two
+     groups rather than against any fixed idea of what "white" looks like. A set
+     may draw its light pieces cream, grey or pale blue; all that matters is
+     that its two kinds of piece are consistently different from each other. */
+  const split2 = values => {
+    let lo = Math.min(...values), hi = Math.max(...values);
+    for(let it = 0; it < 20; it++){
+      const mid = (lo + hi) / 2;
+      const A = values.filter(v => v <= mid), B = values.filter(v => v > mid);
+      if(!A.length || !B.length) return {lo, hi, mid, gap: hi - lo, sep: 0};
+      const nlo = A.reduce((a,b)=>a+b,0)/A.length, nhi = B.reduce((a,b)=>a+b,0)/B.length;
+      if(Math.abs(nlo - lo) < 1e-6 && Math.abs(nhi - hi) < 1e-6) break;
+      lo = nlo; hi = nhi;
+    }
+    const mid = (lo + hi) / 2;
+    const A = values.filter(v => v <= mid), B = values.filter(v => v > mid);
+    // How cleanly the two groups come apart: the distance between them measured
+    // in units of how spread out they are individually.
+    const spread = medianAbsDev(A, median(A)) + medianAbsDev(B, median(B));
+    return {lo, hi, mid, gap: hi - lo, sep: (hi - lo) / (spread + 0.02)};
+  };
+
+  /* Three different ways of asking what colour a piece is, because no single
+     one survives every piece set. The deepest interior is purest when a piece
+     is solid and thick; the whole silhouette is steadier when it is thin; and
+     which side of its own square the ink falls on still works when a set's two
+     colours are nearly the same tone.
+
+     Rather than pick one in advance, each is tried on this screenshot and the
+     winner is whichever splits *these* pieces into two groups most cleanly —
+     which is measurable, and needs no guess about what set we are looking at. */
+  const cands = [
+    {key: 'coreLum',   stat: split2(occupied.map(o => o.sq.coreLum))},
+    {key: 'fgLum',     stat: split2(occupied.map(o => o.sq.fgLum))},
+    {key: 'lightFrac', stat: split2(occupied.map(o => o.sq.lightFrac))},
+  ];
+  cands.sort((a, b) => b.stat.sep - a.stat.sep);
+  const pick = cands[0];
+
+  /* Which of the two groups is the white one is a different question from where
+     the line between them falls, and it needs a different answer. A set with a
+     heavy outline inverts nearly every measurement — its white pieces are
+     mostly dark ink, its black pieces mostly light — so the group that measures
+     lighter overall can easily be the black one. What does not invert is the
+     fill: a piece is called white because the middle of it is light. So the
+     groups are formed by whatever separates them most cleanly, and then named
+     by whichever has the lighter core. */
+  const groupA = occupied.filter(o => o.sq[pick.key] > pick.stat.mid);
+  const groupB = occupied.filter(o => o.sq[pick.key] <= pick.stat.mid);
+  const coreA = median(groupA.map(o => o.sq.coreLum));
+  const coreB = median(groupB.map(o => o.sq.coreLum));
+  // If the cores say nothing, keep the statistic's own direction.
+  const aboveIsWhite = Math.abs(coreA - coreB) > 0.05 ? coreA > coreB : true;
+  const swap = !!opts.swapColours;
+
+  const items = occupied.map(o => {
+    const above = o.sq[pick.key] > pick.stat.mid;
+    const light = above === aboveIsWhite;
+    return {idx: o.i, rank: Math.floor(o.i / 8), file: o.i % 8, white: light !== swap,
+            f: describe(o.sq)};
+  });
+
+  const board = new Array(64).fill(null);
+  const conf = new Array(64).fill(0);
+  const clusters = {};
+  for(const white of [true, false]){
+    const mine = items.filter(i => i.white === white);
+    if(!mine.length) continue;
+    const groups = cluster(mine);
+    clusters[white ? 'w' : 'b'] = groups;
+    const picked = assign(groups, white);
+    for(const [idx, v] of picked){
+      board[idx] = white ? v.type : v.type.toLowerCase();
+      conf[idx] = v.margin;
+    }
+  }
+
+  const orientation = opts.orientation || orient(board);
+  const turn = opts.turn || 'w';
+  const res = {
+    ok: true, grid, board, conf, orientation, contrast,
+    fen: toFen(board, orientation, turn),
+    problems: problems(board),
+    canvas: full.canvas,
+  };
+  if(opts.wantNorms){
+    res.norms = items.map(i => ({idx: i.idx, white: i.white, norm: Array.from(i.f.norm)}));
+  }
+  if(opts.wantFeatures){
+    /* Features exactly as the classifier will see them at run time — same
+       clustering, same context — so training data and live data match. */
+    res.items = [];
+    for(const key of ['w', 'b']){
+      const groups = clusters[key];
+      if(!groups) continue;
+      const ctx = contextOf(groups);
+      for(const g of groups) for(const m of g.members){
+        res.items.push({idx: m.idx, white: m.white, size: g.members.length,
+                        x: featureVector(m.f, ctx)});
+      }
+    }
+  }
+  return res;
+}
+
+/* Re-derive a FEN after the user has corrected squares, flipped the board or
+   set whose move it is — same rules, no re-reading of pixels. */
+function fenFrom(board, orientation, turn, castleOverride){
+  const fen = toFen(board, orientation, turn);
+  if(castleOverride === undefined) return fen;
+  const parts = fen.split(' ');
+  parts[2] = castleOverride || '-';
+  return parts.join(' ');
+}
+
+return {recognise, fenFrom, toFen, problems, orient, findGrid, refineGrid, readSquare,
+        drawToCanvas, lumaOf, describe, iou, cluster, typeScores, setModel,
+        featureVector, contextOf, FEATURES, TYPES, NORM};
+})();
+
+Vision.setModel({"features":["h","w","aspect","fill","asym","cy","cover","wideAt","relH","relW","relArea","spanH","medH","medW","topW","midW","botW","runsTop","runsUpper","runsMid","holes","b0","b1","b2","b3","b4","b5","b6","b7","b8","b9","b10","b11","b12","b13","b14","b15"],"types":["K","Q","R","B","N","P"],"mean":[0.580512,0.46064,0.799379,0.650314,0.08273,0.580104,0.212365,0.825342,0.852186,0.796758,0.701576,0.38869,0.959751,0.95083,0.320872,0.622857,0.913196,0.277171,0.264877,0.212648,0.184135,0.250758,0.390985,0.481166,0.505689,0.551479,0.609161,0.618265,0.617872,0.627842,0.647206,0.68059,0.734629,0.766179,0.846967,0.922714,0.903678],"sd":[0.099054,0.094706,0.133933,0.106378,0.134821,0.03827,0.075187,0.193112,0.118425,0.138694,0.183055,0.366511,0.113919,0.143813,0.171915,0.175001,0.158779,0.153726,0.160209,0.060827,0.339079,0.190121,0.166802,0.186477,0.196979,0.19874,0.169173,0.196115,0.195271,0.166413,0.147042,0.143971,0.15172,0.220953,0.201827,0.173637,0.168224],"w":[[1.67891,-0.76228,0.81626,-0.26507,-0.77941,-0.3417,-0.60684,-1.11074,-0.21426,0.44165,0.23733,0.16525,-0.10319,-0.11763,0.17464,0.13383,-0.28147,-0.80341,-0.37407,0.23605,0.2669,0.91483,-0.68275,0.36983,-1.50439,-1.02108,1.40213,2.18477,0.62908,-0.45669,0.3996,-0.12063,-0.45884,-0.37121,-0.21435,-0.27455,-0.24796],[-1.3828,-0.17893,-1.27396,-0.47397,-0.94691,0.40504,2.10268,-2.20797,-0.50369,0.488,1.3169,0.74858,-0.03041,0.67218,0.01838,-0.13068,0.03452,0.31771,1.73856,-0.15629,-0.12307,0.38871,-0.40516,-0.54308,1.94043,0.03462,-0.4572,-1.17334,-0.01393,-0.25851,1.62045,0.01298,-2.40048,0.8695,-0.58824,0.35431,-0.30055],[-0.11849,1.53903,0.23584,0.93327,0.47087,1.78383,-1.07818,-0.70541,-0.40135,-0.01819,0.49578,-0.082,0.40324,0.45807,1.4588,-0.20136,-0.16068,1.2604,0.50547,-0.62749,0.42616,1.54734,1.24338,-0.01166,0.20823,-0.25236,0.32825,0.15677,0.10202,-0.54322,-0.08452,-0.35775,0.24536,0.05862,-0.21641,-0.84215,0.56594],[1.13563,-0.16604,0.16651,-1.07587,-1.3012,-1.88858,-1.24905,0.34146,0.37555,-0.34833,-0.34774,-0.09018,0.22584,-0.58529,-0.84651,0.21882,0.12606,-0.2029,-0.38403,0.12576,0.09692,-0.87415,-0.74855,-1.76726,0.25099,0.20774,-0.43662,-0.68372,-0.46201,1.00235,-0.46614,-0.53462,0.45666,-0.25871,1.02425,-0.01169,0.25002],[-1.12031,-0.3955,-0.31497,0.97096,2.2213,-0.11867,1.35812,-0.09526,0.0772,0.15082,-0.45936,0.0959,0.02557,-0.4267,-0.62286,1.3764,0.1585,-0.00725,-1.15431,0.32389,-0.11506,-1.70629,0.66093,0.42077,-0.29681,0.56425,-0.34594,0.14175,1.96661,0.58721,-1.35184,1.54433,0.25974,-1.10806,-0.68462,-0.02507,0.32507],[-0.19293,-0.03627,0.37033,-0.08931,0.33535,0.16008,-0.52673,3.77794,0.66655,-0.71395,-1.24291,-0.83755,-0.52104,-0.00063,-0.18245,-1.39701,0.12308,-0.56454,-0.33162,0.09808,-0.55184,-0.27044,-0.06784,1.5314,-0.59845,0.46682,-0.49062,-0.62623,-2.22178,-0.33114,-0.11754,-0.54431,1.89755,0.80986,0.67936,0.79914,-0.59252]],"b":[-0.32651,-1.53703,0.59791,1.60035,-0.75481,0.42009]});
+</script>
+<script>
 /* =========================================================================
    LOZZA, WRAPPED
 
@@ -2100,10 +3336,22 @@ const state = {
   notes: [],             // per-move annotator output, filled on load
   verdicts: [],          // per-move engine judgement, filled in the background
   analysing: false,
-  cancelAnalysis: false,
+  analysisToken: 0,      // bumped on every load; retires any run still in flight
   flipped: false,
   // free board
   free: {sans: [], fens: [ChessEngine.START], selected: null, targets: [], promo: null, thinking: false, engineLines: null},
+  // reading a position off a picture
+  scan: {
+    stage: 'idle',       // idle | reading | ready | failed
+    sq: null,            // 64 squares, engine indexing, once a picture has been read
+    turn: 'w',
+    castleWanted: {K: true, Q: true, k: true, q: true},
+    orientation: 'white-bottom',
+    armed: null,         // which palette piece is loaded, or 'erase'
+    problems: [],
+    message: '',
+    edited: false,
+  },
   banner: null,
   tab: 'move',           // 'move' | 'plan'
 };
@@ -2116,8 +3364,154 @@ function posFromFen(fen){ const p = new ChessEngine.Position(ChessEngine.START);
 /* Current view: which fens/sans list and which ply. */
 function view(){
   if(state.mode === 'free') return {fens: state.free.fens, sans: state.free.sans, ply: state.free.fens.length - 1};
+  if(state.mode === 'scan') return {fens: [scanFen()], sans: [], ply: 0};
   if(!state.game) return {fens: [ChessEngine.START], sans: [], ply: 0};
   return {fens: state.game.fens, sans: state.game.sans, ply: state.ply};
+}
+
+/* ---------- reading a position off a picture ---------- */
+
+/* Which castling rights the position on the board could still have. A right
+   only survives if the king and the rook are both sitting where they started —
+   anything else and offering the option would just be a way to build an
+   impossible position. */
+function castlePossible(sq){
+  const at = (f, r) => sq[ChessEngine.sq(f, r)];
+  return {
+    K: at(4,0) === 'K' && at(7,0) === 'R',
+    Q: at(4,0) === 'K' && at(0,0) === 'R',
+    k: at(4,7) === 'k' && at(7,7) === 'r',
+    q: at(4,7) === 'k' && at(0,7) === 'r',
+  };
+}
+
+function scanFen(){
+  const s = state.scan;
+  if(!s.sq) return ChessEngine.START;
+  let placement = '';
+  for(let rank = 7; rank >= 0; rank--){
+    let run = 0;
+    for(let file = 0; file < 8; file++){
+      const p = s.sq[ChessEngine.sq(file, rank)];
+      if(!p){ run++; }
+      else { if(run){ placement += run; run = 0; } placement += p; }
+    }
+    if(run) placement += run;
+    if(rank) placement += '/';
+  }
+  const can = castlePossible(s.sq);
+  const rights = ['K','Q','k','q'].filter(k => can[k] && s.castleWanted[k]).join('');
+  return `${placement} ${s.turn} ${rights || '-'} - 0 1`;
+}
+
+/* Everything that would stop this position being analysable, in plain words.
+   Better to say so here than to hand the engine something impossible and let it
+   produce confident nonsense. */
+function scanProblems(){
+  const s = state.scan;
+  if(!s.sq) return [];
+  const out = [];
+  const count = ch => s.sq.filter(p => p === ch).length;
+  const say = (n, what) => n === 0 ? `there is no ${what}` : `there are ${n} ${what}s`;
+  if(count('K') !== 1) out.push(say(count('K'), 'white king'));
+  if(count('k') !== 1) out.push(say(count('k'), 'black king'));
+  if(count('P') > 8) out.push(`there are ${count('P')} white pawns`);
+  if(count('p') > 8) out.push(`there are ${count('p')} black pawns`);
+  for(let f = 0; f < 8; f++){
+    for(const r of [0, 7]){
+      const p = s.sq[ChessEngine.sq(f, r)];
+      if(p && p.toUpperCase() === 'P'){
+        out.push(`a pawn is on ${ChessEngine.algebraic(ChessEngine.sq(f, r))}, where no pawn can stand`);
+        f = 8; break;
+      }
+    }
+  }
+  if(!out.length){
+    // The side that just moved cannot still be sitting in check.
+    const pos = posFromFen(scanFen());
+    const idle = s.turn === 'w' ? ChessEngine.BLACK : ChessEngine.WHITE;
+    if(pos.inCheck(idle)){
+      out.push(`${idle === ChessEngine.WHITE ? 'White' : 'Black'} is in check, but it is ` +
+               `${s.turn === 'w' ? 'White' : 'Black'}'s move — that cannot happen`);
+    }
+  }
+  return out;
+}
+
+async function readImage(src){
+  const s = state.scan;
+  s.stage = 'reading'; s.message = 'Reading the board…'; s.problems = [];
+  state.banner = null;
+  render();
+  // Let the browser paint the message before the pixel work blocks the thread.
+  await new Promise(r => setTimeout(r, 30));
+  try{
+    const img = await toImage(src);
+    const res = await Vision.recognise(img, {});
+    if(!res.ok){
+      s.stage = 'failed';
+      s.message = res.reason === 'no-board'
+        ? 'No chessboard found in that picture. It needs to show the whole board, square-on and unrotated — a screenshot rather than a photo taken at an angle.'
+        : 'A board was found but no pieces could be made out. If the picture is very small, try a larger one.';
+      render();
+      return;
+    }
+    const pos = posFromFen(Vision.toFen(res.board, res.orientation, 'w'));
+    s.sq = pos.board.slice();
+    s.orientation = res.orientation;
+    s.turn = 'w';
+    s.castleWanted = {K: true, Q: true, k: true, q: true};
+    s.armed = null;
+    s.edited = false;
+    s.stage = 'ready';
+    s.message = '';
+    state.flipped = res.orientation === 'black-bottom';
+    s.problems = scanProblems();
+  }catch(e){
+    s.stage = 'failed';
+    s.message = 'That picture could not be read: ' + e.message;
+  }
+  render();
+}
+
+/* Accepts whatever the platform hands over: a File from the picker or a drop, a
+   blob from the clipboard, or a data URL from the Android wrapper. */
+function toImage(src){
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('the file is not an image this browser can open'));
+    if(typeof src === 'string'){ img.src = src; return; }
+    const fr = new FileReader();
+    fr.onload = () => { img.src = fr.result; };
+    fr.onerror = () => reject(new Error('the file could not be read'));
+    fr.readAsDataURL(src);
+  });
+}
+
+function startScanOver(){
+  state.scan.stage = 'idle';
+  state.scan.sq = null;
+  state.scan.message = '';
+  state.scan.problems = [];
+  state.scan.armed = null;
+  state.banner = null;
+  render();
+}
+
+/* Hand the finished position to the free board, which already knows how to
+   explain a move, ask the engine and lay out the long-term plan. */
+function analyseScan(){
+  const s = state.scan;
+  s.problems = scanProblems();
+  if(s.problems.length){ render(); return; }
+  const fen = scanFen();
+  state.free = {sans: [], fens: [fen], selected: null, targets: [], promo: null,
+                thinking: false, engineLines: null};
+  state.mode = 'free';
+  state.banner = {tone: 'ok', text: 'Position loaded. Play moves from here, or read the plan on the right.'};
+  render();
+  askEngineHere();
 }
 
 /* ---------- move quality ---------- */
@@ -2175,18 +3569,35 @@ function loadGame(text){
   });
 
   render();
-  runAnalysis();
+  startAnalysis();
 }
 
-/* ---------- the engine pass ---------- */
-async function runAnalysis(){
-  if(!state.game || state.analysing) return;
-  state.analysing = true; state.cancelAnalysis = false;
+/* ---------- the engine pass ----------
+   Every run carries a generation token. Loading another game bumps the token,
+   which retires any run still in flight: it checks the token before each ply
+   AND after every await, because an await is exactly where a new game can be
+   loaded underneath it.
+
+   This is not hypothetical. Without it, loading a second game while the first
+   was still grading left the OLD loop writing its results into the NEW game's
+   verdicts array — analysis text describing a position that was never on the
+   board. Runs are also chained rather than run concurrently, so a retiring run
+   has finished before its replacement begins. */
+let analysisChain = Promise.resolve();
+
+function startAnalysis(){
+  const token = ++state.analysisToken;
+  analysisChain = analysisChain.then(() => runAnalysis(token)).catch(() => {});
+}
+
+async function runAnalysis(token){
+  if(!state.game || state.analysisToken !== token) return;
+  state.analysing = true;
   const g = state.game;
   const movetime = Number(($('speed') || {}).value || 1200);
 
   for(let i = 0; i < g.sans.length; i++){
-    if(state.cancelAnalysis) break;
+    if(state.analysisToken !== token){ state.analysing = false; return; }
     try{
       const before = posFromFen(g.fens[i]);
       const mover = before.turn;
@@ -2198,6 +3609,7 @@ async function runAnalysis(){
 
       // What was best here? Reported from the mover's point of view.
       const res = await Engine.analyse(g.fens[i], {movetime});
+      if(state.analysisToken !== token){ state.analysing = false; return; }
       const bestLine = res.lines[0];
       if(!bestLine) continue;
       const bestEval = {cp: bestLine.cp, mate: bestLine.mate};
@@ -2212,6 +3624,7 @@ async function runAnalysis(){
         refutation = bestLine.pv ? bestLine.pv.slice(1) : null;
       } else {
         const after = await Engine.analyse(g.fens[i+1], {movetime, fresh:false});
+        if(state.analysisToken !== token){ state.analysing = false; return; }
         playedEval = after.lines[0]
           ? Engine.negate({cp: after.lines[0].cp, mate: after.lines[0].mate})
           : bestEval;
@@ -2237,6 +3650,10 @@ async function runAnalysis(){
       }
 
       state.verdicts[i] = {
+        // The position this verdict was computed FOR. The renderer checks it
+        // before showing anything, so a stale verdict can never be displayed
+        // against the wrong board — belt as well as braces.
+        forFen: g.fens[i],
         loss, verdict, bestSan, bestNote,
         evalAfter: Engine.toWhitePov(playedEval, mover),
         depth: bestLine.depth,
@@ -2251,6 +3668,7 @@ async function runAnalysis(){
     }catch(e){ /* one bad ply must not kill the pass */ }
   }
   state.analysing = false;
+  if(state.analysisToken !== token) return;
   renderProgress(g.sans.length, g.sans.length);
   render();
 }
@@ -2398,13 +3816,14 @@ function render(){
   renderExplain();
   renderPlan();
   renderControls();
+  renderScan();
   renderBanner();
 }
 
 function renderModeTabs(){
   const el = $('modeTabs');
-  el.innerHTML = [['review','Review a game'], ['free','Free board']].map(([k,label]) =>
-    `<button class="tab${state.mode===k?' active':''}" data-mode="${k}">${label}</button>`).join('');
+  el.innerHTML = [['review','Review a game'], ['scan','From a picture'], ['free','Free board']]
+    .map(([k,label]) => `<button class="tab${state.mode===k?' active':''}" data-mode="${k}">${label}</button>`).join('');
 }
 
 function renderBanner(){
@@ -2424,6 +3843,18 @@ function renderHeader(){
       op ? `Right now this is the <b>${escapeHtml(op.name)}</b> <span class="mono">${op.eco}</span>.` : ''}</p>`;
     return;
   }
+  if(state.mode === 'scan'){
+    const s = state.scan;
+    if(s.stage === 'ready'){
+      const op = openingAt([scanFen()], 0);
+      el.innerHTML = `<h2>Is this the position?</h2>` +
+        `<p class="hint">Check it against your picture and fix anything that came out wrong, then say whose move it is.` +
+        (op ? ` This looks like the <b>${escapeHtml(op.name)}</b> <span class="mono">${op.eco}</span>.` : '') + `</p>`;
+    } else {
+      el.innerHTML = `<h2>From a picture</h2><p class="hint">Give it a screenshot of a chessboard and it will read the position off it, then explain it.</p>`;
+    }
+    return;
+  }
   if(!state.game){ el.innerHTML = `<h2>Review a game</h2><p class="hint">Paste a game below — from Lichess, Chess.com, anywhere — and every move gets explained.</p>`; return; }
   const g = state.game;
   const op = openingAt(g.fens, v.ply);
@@ -2439,7 +3870,7 @@ function renderBoard(){
   boardEl.innerHTML = '';
 
   let lastFrom = -1, lastTo = -1;
-  if(v.ply > 0){
+  if(v.ply > 0 && state.mode !== 'scan'){
     const prev = posFromFen(v.fens[v.ply-1]);
     const lg = prev.legalMoves();
     const m = lg.find(mm => prev.san(mm, lg) === v.sans[v.ply-1]);
@@ -2485,6 +3916,8 @@ const VERDICT_MARK = {best:'', good:'', inaccuracy:'?!', mistake:'?', blunder:'?
 function renderRibbon(){
   const el = $('ribbon');
   const v = view();
+  // There is no move list when a position has simply been read off a picture.
+  if(state.mode === 'scan'){ el.innerHTML = ''; return; }
   if(!v.sans.length){
     el.innerHTML = `<button class="empty" disabled>${state.mode==='free' ? 'Tap a piece to begin.' : 'No game loaded yet.'}</button>`;
     return;
@@ -2493,7 +3926,9 @@ function renderRibbon(){
   for(let i=0;i<v.sans.length;i++){
     if(i%2===0) html += `<span class="num">${i/2+1}.</span>`;
     const j = state.mode==='review' ? i : null;
-    const ver = state.mode==='review' && state.verdicts[i] ? state.verdicts[i].verdict.key : null;
+    const vd = state.mode==='review' ? state.verdicts[i] : null;
+    const stale = vd && vd.forFen && state.game && vd.forFen !== state.game.fens[i];
+    const ver = vd && !stale ? vd.verdict.key : null;
     const cur = (state.mode==='review' && state.ply === i+1) || (state.mode==='free' && i===v.sans.length-1);
     html += `<button class="${cur?'current ':''}${ver?'v-'+ver:''}"${j!==null?` data-jump="${j}"`:''}>` +
             `${escapeHtml(v.sans[i])}${ver?VERDICT_MARK[ver]:''}</button>`;
@@ -2514,6 +3949,17 @@ function renderProgress(done, total){
 function renderExplain(){
   const el = $('panel-move');
   const v = view();
+
+  if(state.mode === 'scan'){
+    if(state.scan.stage !== 'ready'){
+      el.innerHTML = `<p class="hint">Once a picture has been read, the position appears on the board for you to check.</p>`;
+    } else {
+      el.innerHTML = `<p class="hint">Nothing has been played yet — this is a position, not a game. ` +
+        `Open <b>The plan</b> to see what each side is playing for here, or press ` +
+        `<b>Analyse this position</b> to hear what the engine makes of it.</p>`;
+    }
+    return;
+  }
 
   if(state.mode === 'free'){
     if(!v.sans.length){
@@ -2547,7 +3993,9 @@ function renderExplain(){
 
   const i = state.ply - 1;
   const note = state.notes[i];
-  const ver  = state.verdicts[i];
+  let ver = state.verdicts[i];
+  // Never show analysis computed for a different position, whatever the reason.
+  if(ver && ver.forFen && ver.forFen !== state.game.fens[i]) ver = null;
   const num  = Math.floor(i/2) + 1;
   const dots = i % 2 === 0 ? '.' : '…';
 
@@ -2649,11 +4097,59 @@ function renderTabs(){
 function renderControls(){
   $('reviewTools').hidden = state.mode !== 'review';
   $('freeTools').hidden = state.mode !== 'free';
-  const v = view();
+  $('scanInput').hidden = state.mode !== 'scan' || state.scan.stage === 'ready';
+  $('scanEdit').hidden  = state.mode !== 'scan' || state.scan.stage !== 'ready';
+  /* Stepping back and forth through a game, and flipping the view, mean nothing
+     while a single position is being checked — and a second flip control next
+     to "Turn the board round" would only muddle what that one does. */
+  const stepper = document.querySelector('.controls');
+  if(stepper) stepper.hidden = state.mode === 'scan';
   const atStart = state.mode==='review' && state.ply === 0;
   const atEnd   = state.mode==='review' && state.game && state.ply >= state.game.sans.length;
-  if($('btnPrev')) $('btnPrev').disabled = state.mode==='review' ? atStart : !state.free.sans.length;
+  if($('btnPrev')) $('btnPrev').disabled = state.mode==='review' ? atStart
+                                         : state.mode==='scan' ? true : !state.free.sans.length;
   if($('btnNext')) $('btnNext').disabled = state.mode==='review' ? (!state.game || atEnd) : true;
+}
+
+function renderScan(){
+  const s = state.scan;
+  const status = $('scanStatus');
+  if(status){
+    if(s.stage === 'reading') status.innerHTML = `<div class="banner ok">${escapeHtml(s.message)}</div>`;
+    else if(s.stage === 'failed') status.innerHTML = `<div class="banner bad">${escapeHtml(s.message)}</div>`;
+    else status.innerHTML = '';
+  }
+  if(state.mode !== 'scan' || s.stage !== 'ready') return;
+
+  $('turnRow').innerHTML = [['w','White to move'], ['b','Black to move']]
+    .map(([k, label]) => `<button type="button" data-turn="${k}"${s.turn===k?' class="on"':''}>${label}</button>`).join('');
+
+  const piece = p => `<svg class="piece ${p === p.toUpperCase() ? 'white' : 'black'}" viewBox="0 0 45 45">` +
+                     `<use href="#pc-${p.toLowerCase()}"></use></svg>`;
+  const order = ['K','Q','R','B','N','P','k','q','r','b','n','p'];
+  $('palette').innerHTML =
+    order.map(p => `<button type="button" class="pal${s.armed===p?' on':''}" data-arm="${p}" ` +
+                   `aria-label="${p === p.toUpperCase() ? 'white' : 'black'} ${p.toLowerCase()}">${piece(p)}</button>`).join('') +
+    `<button type="button" class="pal erase${s.armed==='erase'?' on':''}" data-arm="erase">clear</button>`;
+
+  const can = castlePossible(s.sq);
+  const labels = {K: 'White 0-0', Q: 'White 0-0-0', k: 'Black 0-0', q: 'Black 0-0-0'};
+  const any = ['K','Q','k','q'].some(k => can[k]);
+  $('castleBlock').hidden = !any;
+  $('castleRow').innerHTML = ['K','Q','k','q'].filter(k => can[k]).map(k =>
+    `<label><input type="checkbox" data-castle="${k}"${s.castleWanted[k]?' checked':''}> ${labels[k]}</label>`).join('');
+
+  const note = $('scanEdit').querySelector('.scan-note');
+  if(note) note.remove();
+  const el = document.createElement('p');
+  el.className = 'scan-note';
+  if(s.problems.length){
+    el.innerHTML = `<b>This position cannot be right:</b> ${escapeHtml(s.problems.join('; '))}. ` +
+                   `Fix it above and the analysis will run.`;
+  } else {
+    el.textContent = 'If the board came out the other way up, turn it round — that changes which end is White’s.';
+  }
+  $('scanEdit').appendChild(el);
 }
 
 /* ---------- interaction ---------- */
@@ -2664,6 +4160,16 @@ function go(ply){
 }
 
 function onBoardClick(idx){
+  if(state.mode === 'scan'){
+    const s = state.scan;
+    if(s.stage !== 'ready' || !s.armed) return;
+    s.sq[idx] = s.armed === 'erase' ? null : s.armed;
+    s.edited = true;
+    s.problems = scanProblems();
+    renderBoard();
+    renderScan();
+    return;
+  }
   if(state.mode !== 'free') return;
   const f = state.free;
   const pos = posFromFen(f.fens[f.fens.length-1]);
@@ -2775,7 +4281,86 @@ function wire(){
     if(e.key === 'ArrowLeft'){ e.preventDefault(); $('btnPrev').click(); }
     if(e.key === 'ArrowRight'){ e.preventDefault(); $('btnNext').click(); }
   });
+
+  /* ---- reading a position off a picture ---- */
+  $('btnPickImage').addEventListener('click', () => $('fileImage').click());
+  $('fileImage').addEventListener('change', e => {
+    const f = e.target.files && e.target.files[0];
+    if(f) readImage(f);
+    e.target.value = '';               // so the same file can be picked twice
+  });
+  $('btnScanAgain').addEventListener('click', startScanOver);
+  $('btnAnalyseScan').addEventListener('click', analyseScan);
+  $('btnScanFlip').addEventListener('click', () => {
+    const s = state.scan;
+    if(!s.sq) return;
+    s.sq = s.sq.slice().reverse();     // a half turn of the board
+    s.orientation = s.orientation === 'white-bottom' ? 'black-bottom' : 'white-bottom';
+    state.flipped = s.orientation === 'black-bottom';
+    s.problems = scanProblems();
+    render();
+  });
+  /* Some piece sets — an outline set, or one whose two colours are close —
+     can come out the wrong way round as a whole. One tap beats correcting
+     thirty squares. */
+  $('btnScanSwap').addEventListener('click', () => {
+    const s = state.scan;
+    if(!s.sq) return;
+    s.sq = s.sq.map(p => !p ? null
+                          : (p === p.toUpperCase() ? p.toLowerCase() : p.toUpperCase()));
+    s.edited = true;
+    s.problems = scanProblems();
+    render();
+  });
+  $('turnRow').addEventListener('click', e => {
+    const b = e.target.closest('[data-turn]'); if(!b) return;
+    state.scan.turn = b.dataset.turn;
+    state.scan.problems = scanProblems();
+    renderScan();
+  });
+  $('palette').addEventListener('click', e => {
+    const b = e.target.closest('[data-arm]'); if(!b) return;
+    state.scan.armed = state.scan.armed === b.dataset.arm ? null : b.dataset.arm;
+    renderScan();
+  });
+  $('castleRow').addEventListener('change', e => {
+    const b = e.target.closest('[data-castle]'); if(!b) return;
+    state.scan.castleWanted[b.dataset.castle] = b.checked;
+  });
+
+  const zone = $('dropZone');
+  ['dragenter','dragover'].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); zone.classList.add('over');
+  }));
+  ['dragleave','drop'].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); zone.classList.remove('over');
+  }));
+  zone.addEventListener('drop', e => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if(f) { state.mode = 'scan'; readImage(f); }
+  });
+
+  /* Paste works from anywhere on the page: someone who has just copied a
+     screenshot should not have to find the right box first. */
+  document.addEventListener('paste', e => {
+    if(e.target && e.target.tagName === 'TEXTAREA') return;
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    for(const it of items){
+      if(it.type && it.type.indexOf('image') === 0){
+        const f = it.getAsFile();
+        if(f){ e.preventDefault(); state.mode = 'scan'; readImage(f); return; }
+      }
+    }
+  });
 }
+
+/* The Android wrapper calls this when a screenshot is shared into the app, so
+   a picture can arrive without anyone touching the page. */
+window.receiveSharedImage = function(dataUrl){
+  state.mode = 'scan';
+  state.tab = 'move';
+  readImage(dataUrl);
+};
 
 /* A short, genuinely instructive game to press one button and see the thing
    work: Morphy's Opera House game, which every explanation in the app has an

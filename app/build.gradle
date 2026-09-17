@@ -10,8 +10,8 @@ android {
         applicationId "com.chesscoach.trainer"
         minSdk 24          // Android 7.0 — covers essentially every phone still in use
         targetSdk 34
-        versionCode 4
-        versionName "1.3"
+        versionCode 7
+        versionName "1.6"
     }
 
     buildTypes {

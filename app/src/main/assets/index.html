@@ -395,6 +395,20 @@
 .why.v-mistake{border-left-color:#D9843C}
 .why.v-blunder,.why.v-missed{border-left-color:#B44A50}
 .why-alt{display:block;margin-top:.5rem;color:var(--ink-soft)}
+.lever{margin-top:.85rem;padding:.65rem .75rem;border-radius:10px;background:var(--panel-2);
+  border-left:3px solid var(--brass)}
+.lever h4{margin:0 0 .35rem;font-size:.92rem;color:var(--brass-strong)}
+.lever p{margin:0;font-size:.95rem;line-height:1.6}
+.lever.cost{border-left-color:var(--ink-faint)}
+.lever.cost h4{color:var(--ink-soft)}
+#drillQuestion{margin-bottom:.7rem}
+#drillQuestion .q{font-size:1.02rem;line-height:1.6;margin:.3rem 0 0}
+#drillResult{margin-top:.7rem}
+#drillResult .verdict{padding:.65rem .75rem;border-radius:10px;font-size:.95rem;line-height:1.6}
+#drillResult .verdict.right{background:var(--moss-tint);border-left:3px solid var(--moss)}
+#drillResult .verdict.wrong{background:var(--garnet-tint);border-left:3px solid var(--garnet)}
+#drillResult .verdict h4{margin:0 0 .3rem;font-size:.95rem}
+.score{font-size:.8rem;color:var(--ink-faint);margin-top:.5rem}
 /* ---- reading a position off a picture ---- */
 .drop{border:1.5px dashed var(--rule,#C9C0A4);border-radius:12px;padding:.9rem .85rem;
   background:var(--panel);text-align:left}
@@ -515,7 +529,7 @@
       <div class="promo-bar" id="promoBar" hidden></div>
       <div class="history-ribbon" id="ribbon"></div>
 
-      <div class="controls">
+      <div class="controls" id="stepControls">
         <button class="btn ghost" id="btnPrev">‹ Back</button>
         <button class="btn ghost" id="btnNext">Next ›</button>
         <button class="btn ghost" id="btnFlip">⇅ Flip board</button>
@@ -523,6 +537,12 @@
       <div id="freeTools" class="controls" hidden>
         <button class="btn" id="btnEngineHere">What does the engine think?</button>
         <button class="btn ghost" id="btnResetFree">Reset board</button>
+      </div>
+
+      <div id="drillTools" hidden>
+        <div id="drillQuestion"></div>
+        <div class="pgn-actions" id="drillButtons"></div>
+        <div id="drillResult"></div>
       </div>
 
       <div id="scanEdit" hidden>
@@ -1853,6 +1873,539 @@ return {read, phase, centre, files, majorities, outposts, bishopQuality, shelter
 
 </script>
 <script>
+/* levers.js — what a thematic pawn move is FOR, and what makes it topical now.
+
+   A lever is a pawn advance whose value lies in its timing: a4 against a coming
+   ...b5, b4 against a pawn sitting on c6. This file spots the structural
+   trigger — a pawn you can point at — and says what the move is about.
+
+   WHAT THIS FILE CLAIMS, AND WHAT IT DOES NOT
+   It does not tell you to play the move. An earlier version did, and it could
+   not be supported. Measured against the engine over 576 positions, the moves
+   these rules called "the moment" were no better than pushing a pawn at random.
+   Looking at the worst cases explained why, and the explanation is the reason
+   the file still exists: the rules were RIGHT about the board — their pawn
+   really was on b5, really was held only by the a-pawn — but they said so in
+   positions where a bishop was forking two rooks somewhere else. A layer that
+   cannot see tactics has no business recommending a move.
+
+   So the division of labour is explicit. These rules say what the move is for;
+   the engine, which grades every move in this app already, says whether it
+   works here. A move whose idea is right and whose moment is wrong is one of
+   the more instructive things a position can show you, and it only reads that
+   way if the two halves are kept apart.
+
+   Two design rules came out of the same testing and both are load-bearing:
+
+     Say nothing by default. Every detector returns null unless a specific,
+     nameable trigger has fired. The first version spoke up in 575 of 576
+     positions, which is not knowledge, it is reflex. This one speaks in
+     roughly a quarter.
+
+     Only keep what survives. Six rules have been written, measured against the
+     engine, and deleted: f4, the h-pawn storm, the central freeing break, the
+     King's Indian ...f5 break, and the isolated queen's pawn push. The chess
+     behind every one of them is real — ...f5 is the main line of a main-line
+     opening, and d4-d5 is the textbook way to solve an isolated pawn.
+
+     Two of them are worth remembering for whoever writes the next rule. The
+     f-pawn break fires the moment the pawn skeleton appears, whereas the move
+     is played only once the knight has stepped aside and the pieces are lined
+     up behind it: sound 14% of the time against a 52% baseline. The isolani
+     push was worse and more instructive still — sound in none of twelve
+     positions, a disaster in two thirds — because that move is played when the
+     pieces concretely justify it, and no rule about pawns can see pieces.
+
+     The pattern is always the same. A rule fires on a position, not on an idea,
+     and being right about the idea is not enough.
+
+   Rules are written in relative ranks so one rule serves both colours: "their
+   b-pawn has reached their fourth rank" is Black's ...b5 when White is to move
+   and White's b4 when Black is.
+*/
+const Levers = (function(){
+'use strict';
+
+const E = ChessEngine;
+const A = Annotator;
+const {WHITE, BLACK, sq, fileOf, rankOf, algebraic, color, type} = E;
+const FILES = 'abcdefgh';
+
+const other   = s => s === WHITE ? BLACK : WHITE;
+/* "...a6" is Black's move; White's is just "a3". Getting this wrong makes the
+   prose read as though the wrong side played it. */
+const moveName = (side, square) => (side === BLACK ? '...' : '') + algebraic(square);
+const forward = s => s === WHITE ? 1 : -1;
+
+/* Relative geometry: relRank 1 is a side's own back rank, 8 the promotion rank. */
+const absRank  = (side, relRank) => side === WHITE ? relRank - 1 : 8 - relRank;
+const relRankOf = (side, s) => side === WHITE ? rankOf(s) + 1 : 8 - rankOf(s);
+const sqAt = (file, side, relRank) => sq(file, absRank(side, relRank));
+
+function at(pos, file, side, relRank){
+  const r = absRank(side, relRank);
+  if(r < 0 || r > 7 || file < 0 || file > 7) return null;
+  return pos.board[sq(file, r)];
+}
+const ownPawnAt = (pos, side, file, relRank) => {
+  const p = at(pos, file, side, relRank);
+  return !!p && color(p) === side && type(p) === 'P';
+};
+/* relRank counted from the OPPONENT's side, so "their pawn on their 4th". */
+const foePawnAt = (pos, side, file, relRank) => {
+  const o = other(side);
+  const p = at(pos, file, o, relRank);
+  return !!p && color(p) === o && type(p) === 'P';
+};
+
+/* The shape of a pawn push, whether or not it is this side's turn. */
+function pushShape(pos, side, file, fromRel, toRel){
+  if(!ownPawnAt(pos, side, file, fromRel)) return null;
+  const from = sqAt(file, side, fromRel), to = sqAt(file, side, toRel);
+  if(pos.board[to]) return null;
+  if(Math.abs(toRel - fromRel) === 2){
+    if(fromRel !== 2) return null;                       // double push only from home
+    if(pos.board[sqAt(file, side, fromRel + 1)]) return null;
+  }
+  return {from, to};
+}
+const anyPush = (pos, side, file, toRel) =>
+  pushShape(pos, side, file, toRel - 1, toRel) ||
+  (toRel === 4 ? pushShape(pos, side, file, 2, 4) : null);
+
+/* ------------------------------------------------------------ the centre */
+
+function centreState(pos){
+  let locked = 0, contact = 0, pawns = 0;
+  for(const side of [WHITE, BLACK]){
+    for(const s of A.piecesOf(pos, side, 'P')){
+      const f = fileOf(s);
+      if(f < 2 || f > 5) continue;
+      pawns++;
+      const nr = rankOf(s) + forward(side);
+      if(nr < 0 || nr > 7) continue;
+      const blocker = pos.board[sq(f, nr)];
+      if(blocker && type(blocker) === 'P' && color(blocker) !== side) locked++;
+      for(const df of [-1, 1]){
+        if(f + df < 0 || f + df > 7) continue;
+        const t = pos.board[sq(f + df, nr)];
+        if(t && type(t) === 'P' && color(t) !== side) contact++;
+      }
+    }
+  }
+  if(locked >= 2 && contact === 0) return {key: 'closed', text: 'the centre is locked'};
+  if(locked >= 2) return {key: 'fixed',  text: 'the centre is fixed'};
+  if(contact > 0) return {key: 'tense',  text: 'the centre is still unresolved'};
+  if(pawns <= 2) return {key: 'open',    text: 'the centre is open'};
+  return {key: 'fluid', text: 'the centre has not settled'};
+}
+
+function kingState(pos, side){
+  const k = pos.kingSquare(side);
+  if(k < 0) return {where: 'gone', castled: false, sq: -1};
+  const f = fileOf(k), home = relRankOf(side, k) === 1;
+  if(f >= 5) return {where: 'kingside',  castled: home, sq: k};
+  if(f <= 2) return {where: 'queenside', castled: home, sq: k};
+  return {where: 'centre', castled: false, sq: k};
+}
+
+function developed(pos, side){
+  let n = 0;
+  for(const t of ['N', 'B']){
+    n += A.piecesOf(pos, side, t).filter(s => relRankOf(side, s) > 1).length;
+  }
+  return n;
+}
+
+/* Would this push simply drop the pawn?
+
+   This has to be measured AFTER the pawn has moved. Running a static exchange
+   on the destination while it is still empty answers a different question
+   entirely — it was the first version's largest single source of nonsense. */
+function pushLosesMaterial(pos, side, shape){
+  const after = A.clonePos(pos);
+  const lg = pos.legalMoves();
+  const m = lg.find(mm => mm.from === shape.from && mm.to === shape.to && !mm.promotion);
+  if(!m) return false;                                   // not this side's turn to check
+  after.makeMove(m);
+  return A.see(after, shape.to, other(side)) > 0;
+}
+
+/* A square no enemy pawn can ever cover again. */
+function isPawnHole(pos, side, file, relRank){
+  for(const df of [-1, 1]){
+    const nf = file + df;
+    if(nf < 0 || nf > 7) continue;
+    for(let rr = 2; rr < relRank; rr++) if(ownPawnAt(pos, side, nf, rr)) return false;
+  }
+  return true;
+}
+
+/* ------------------------------------------------------------- the levers */
+
+/* ---- the rook's pawn against a wing expansion ----
+   a4 when Black is about to play ...b5, or has just played it. The rule that
+   started all this, and the one that measured best: its trigger is a pawn you
+   can point at rather than a mood. */
+function leverRookPawn(pos, side, ctx){
+  const shape = anyPush(pos, side, 0, 4);
+  if(!shape) return null;
+
+  const theirB4 = foePawnAt(pos, side, 1, 4);            // their pawn already on b5
+  const theirB2 = foePawnAt(pos, side, 1, 2);            // still at home
+  const theirA3 = foePawnAt(pos, side, 0, 3);            // ...a6, the usual preparation
+  const rookOnB = A.piecesOf(pos, other(side), 'R').some(s => fileOf(s) === 1);
+  const theirB5 = foePawnAt(pos, side, 1, 5);            // already gone past
+
+  const because = [], waiting = [], cost = [];
+  let state;
+
+  if(theirB4){
+    state = 'topical';
+    because.push(`their pawn is on ${algebraic(sqAt(1, other(side), 4))} and this challenges it at once, before it is backed up`);
+    if(theirA3) because.push('it is held only by the a-pawn, so the tension has to break somewhere');
+  } else if(theirB2 && (theirA3 || rookOnB)){
+    state = 'topical';
+    because.push(theirA3
+      ? `they have played ${moveName(other(side), sqAt(0, other(side), 3))}, which has one purpose — the b-pawn comes next`
+      : 'their rook has come to the b-file, which is the same plan a move earlier');
+    because.push('stopping the advance costs less than undoing it afterwards');
+  } else if(theirB5){
+    state = 'late';
+    because.push('their pawn is already past, so there is nothing left to stop');
+  } else {
+    return null;                                          // no wing question here
+  }
+
+  if(isPawnHole(pos, side, 1, 4)){
+    cost.push(`it gives up ${algebraic(sqAt(1, side, 4))} for good — no pawn of yours can ever cover it again`);
+  }
+  return finish(pos, side, ctx, {key: 'rook-pawn', name: 'the a-pawn advance',
+                                 shape, state, because, waiting, cost, flank: true});
+}
+
+/* ---- the minority attack ----
+   The b-pawn advance, but only in the shape that gives it its point: fewer
+   pawns on that wing than they have, and a target already sitting on the c-file
+   waiting to be made weak. Without both, b4 is just a pawn move, and the first
+   version of this rule fired on seven positions in ten and knew nothing. */
+function leverMinority(pos, side, ctx){
+  const shape = anyPush(pos, side, 1, 4);
+  if(!shape) return null;
+
+  const target = foePawnAt(pos, side, 2, 3);              // their pawn on c6
+  if(!target) return null;
+
+  const myWing   = [0,1,2].filter(f => A.piecesOf(pos, side, 'P').some(s => fileOf(s) === f)).length;
+  const theirWing = [0,1,2].filter(f => A.piecesOf(pos, other(side), 'P').some(s => fileOf(s) === f)).length;
+  if(!(myWing < theirWing && theirWing >= 3)) return null;
+
+  const because = [
+    `they have a pawn on ${algebraic(sqAt(2, other(side), 3))} and you have fewer pawns on that wing — which is exactly what makes pushing at them work`,
+    'trade a pair off and the weak pawn left behind is theirs, on a file your rooks already point down',
+  ];
+  const waiting = [], cost = [];
+  if(ctx.centre.key === 'open'){
+    waiting.push('the centre is open, and a slow queenside plan is the wrong thing to be doing while lines are open in the middle');
+  }
+  if(!ctx.king.castled && ctx.king.where === 'centre'){
+    waiting.push('your king is still in the centre, and this plan takes several moves you cannot spare');
+  }
+  return finish(pos, side, ctx, {key: 'minority-attack', name: 'the b-pawn advance',
+                                 shape, state: waiting.length ? 'held' : 'topical',
+                                 because, waiting, cost, flank: true});
+}
+
+/* ------------------------------------------------------------- assembly */
+
+function finish(pos, side, ctx, raw){
+  const {shape, because, waiting, cost} = raw;
+  let state = raw.state;
+
+  /* One brake applies to every lever on a wing: do not start something out
+     there while the king is still sitting in the middle of an open board. */
+  if(raw.flank && ctx.king.where === 'centre' && ctx.centre.key !== 'closed'){
+    waiting.push('your king is still in the centre — settle that before starting anything on a wing');
+  }
+  if(pos.turn === side && pushLosesMaterial(pos, side, shape)){
+    waiting.push('as it stands the pawn simply drops');
+  }
+  if(waiting.length && state === 'topical') state = 'held';
+
+  let san = FILES[fileOf(shape.to)] + (rankOf(shape.to) + 1);
+  if(pos.turn === side){
+    const lg = pos.legalMoves();
+    const m = lg.find(mm => mm.from === shape.from && mm.to === shape.to && !mm.promotion);
+    if(!m) return null;                                   // not actually legal right now
+    san = pos.san(m, lg);
+  }
+
+  return {key: raw.key, name: raw.name, side, san, state,
+          from: shape.from, to: shape.to, yours: pos.turn === side,
+          because, waiting, cost};
+}
+
+/* ---- the rook's pawn against a fianchetto ----
+   h4-h5 when they have a bishop on g7 behind a pawn on g6. Again the trigger is
+   two pieces on two squares rather than "their king is over there". */
+function leverFianchettoStorm(pos, side, ctx){
+  const foeKing = ctx.foeKing;
+  if(foeKing.where !== 'kingside') return null;
+  if(!foePawnAt(pos, side, 6, 3)) return null;            // their g-pawn on g6
+  const oppBishop = at(pos, 6, other(side), 2);           // their bishop on g7
+  if(!oppBishop || color(oppBishop) === side || type(oppBishop) !== 'B') return null;
+  const shape = anyPush(pos, side, 7, 4) || pushShape(pos, side, 7, 4, 5);
+  if(!shape) return null;
+
+  const gSq = algebraic(sqAt(6, other(side), 3));
+  const because = [
+    `their bishop is fianchettoed behind the pawn on ${gSq}, and that pawn is the one square the whole shelter rests on`,
+    `pushing the h-pawn at it forces the question: take, and the h-file opens towards their king; let it pass, and the shelter is holed anyway`,
+  ];
+  /* Two conditions that were once merely noted are now requirements, because
+     noting them was not enough: measured against the engine this rule was the
+     chattiest of the set and the least sound, which is what got its ancestor
+     deleted. Sending the h-pawn forward from in front of your own castled king,
+     or over a centre that can still be opened, is not the pattern this rule is
+     for — so in those positions it now says nothing at all rather than saying
+     the right thing at the wrong moment. */
+  if(ctx.king.where === 'kingside' && ctx.king.castled) return null;
+  if(ctx.centre.key === 'open' || ctx.centre.key === 'tense') return null;
+
+  const waiting = [], cost = [];
+  cost.push('the pawns in front of your own king go with it, so this is a line you commit to rather than try');
+  return finish(pos, side, ctx, {key: 'fianchetto-storm', name: 'the h-pawn advance',
+                                 shape, state: waiting.length ? 'held' : 'topical',
+                                 because, waiting, cost, flank: true});
+}
+
+/* ---- striking a broad centre ----
+   ...c5 when they hold pawns on d4 AND e4. Two pawns abreast in the middle is
+   either a space advantage or a target, and which one it turns out to be is
+   decided by whether it gets hit. */
+function leverBroadCentre(pos, side, ctx){
+  if(!foePawnAt(pos, side, 3, 4)) return null;            // their d-pawn on d4
+  if(!foePawnAt(pos, side, 4, 4)) return null;            // their e-pawn on e4
+  const shape = anyPush(pos, side, 2, 4);                 // c5
+  if(!shape) return null;
+
+  const because = [
+    `they hold ${algebraic(sqAt(3, other(side), 4))} and ${algebraic(sqAt(4, other(side), 4))} together, which is a lot of space and also a lot to defend`,
+    'a broad centre left alone simply squashes you — this is the move that asks it to commit',
+  ];
+  const waiting = [], cost = [];
+  if(developed(pos, side) < 2){
+    waiting.push('almost nothing of yours is developed, and opening the middle rewards whoever has more pieces looking at it');
+  }
+  return finish(pos, side, ctx, {key: 'broad-centre-break', name: 'the c-pawn break',
+                                 shape, state: waiting.length ? 'held' : 'topical',
+                                 because, waiting, cost, flank: false});
+}
+
+const DETECTORS = [leverRookPawn, leverMinority, leverFianchettoStorm, leverBroadCentre];
+
+function context(pos, side){
+  return {centre: centreState(pos), king: kingState(pos, side), foeKing: kingState(pos, other(side))};
+}
+
+function forSide(pos, side){
+  const ctx = context(pos, side);
+  const out = [];
+  for(const d of DETECTORS){
+    const r = d(pos, side, ctx);
+    if(r) out.push(r);
+  }
+  return out;
+}
+
+function read(pos){
+  return {centre: centreState(pos), white: forSide(pos, WHITE), black: forSide(pos, BLACK)};
+}
+
+/* Was the move just played one of these levers? */
+function forMove(before, move){
+  const piece = before.board[move.from];
+  if(!piece || type(piece) !== 'P') return null;
+  return forSide(before, before.turn)
+          .find(i => i.from === move.from && i.to === move.to) || null;
+}
+
+/* What the move is about, in words — and deliberately NOT whether to play it.
+
+   The stronger version of this sentence used to begin "This is the moment for
+   a4", and it could not be supported: tested against the engine, moves the
+   rules called the moment were no better than an arbitrary pawn push. The
+   reason turned out to be instructive rather than fatal. The rules were right
+   about the board — their pawn really was on b5, held really was by the a-pawn
+   — but they were saying it in positions where a piece was hanging somewhere
+   else, and a rule that cannot see tactics has no business recommending a move.
+
+   So it describes the idea and leaves the verdict to the engine, which is
+   already grading every move in this app anyway. Between them the two answer
+   different halves of the same question: what was this for, and did it work. */
+function verdictProse(item){
+  if(!item) return null;
+  const idea = item.because.join(', and ');
+  if(item.state === 'late'){
+    return `${item.san} is the standard idea here, but it has come too late: ` + idea + '.';
+  }
+  if(item.state === 'held'){
+    return `${item.san} is the thematic move in this structure — ` + idea + '. '
+      + `What argues against it right now: ` + item.waiting.join('; ') + '.';
+  }
+  return `${item.san} is the thematic move in this structure: ` + idea + '.'
+    + (item.cost.length ? ` What it costs is permanent — ${item.cost.join('; ')}.` : '');
+}
+
+/* ---------------------------------------------------------------------------
+   THE ONE RULE THAT APPLIES TO EVERY PAWN MOVE
+
+   There is no honest general rule for WHEN to push a pawn — that was the whole
+   lesson of the rules that got deleted. But there is a completely general rule
+   about what a push COSTS, and unlike advice it can be computed exactly:
+
+     a pawn cannot go back, so every square it used to guard and can no longer
+     reach is given up for the rest of the game.
+
+   So instead of a principle, this reports the bill. A square counts as given up
+   when, before the move, some pawn of yours could still one day advance to a
+   square attacking it, and after the move none can. That is a mechanical test,
+   it is checked directly in the tests, and it is true whatever the position.
+   --------------------------------------------------------------------------- */
+function pushCost(before, move){
+  const side = before.turn;
+  const piece = before.board[move.from];
+  if(!piece || type(piece) !== 'P') return null;
+
+  const after = A.clonePos(before);
+  const lg = before.legalMoves();
+  const m = lg.find(mm => mm.from === move.from && mm.to === move.to
+                       && (mm.promotion || null) === (move.promotion || null));
+  if(!m) return null;
+  after.makeMove(m);
+
+  /* Which squares stop being coverable. Only the ones in the half of the board
+     where a piece would actually want to sit are worth naming. */
+  const given = [];
+  /* Rook files are left out. A hole on a3 or h6 is real but almost never worth
+     naming — a piece parked there has nowhere to go, and mentioning it on every
+     wing pawn move buries the times it matters. */
+  for(let f = 1; f <= 6; f++){
+    /* Only holes in front of your own lines. A square on your third rank that
+       no pawn can cover is technically a hole, but nothing of theirs can sit
+       there comfortably, and saying so on half of all pawn moves drowns out
+       the ones that matter. An outpost has to be advanced to be worth having. */
+    for(let rr = 4; rr <= 6; rr++){
+      const wasHole = isPawnHole(before, side, f, rr);
+      const nowHole = isPawnHole(after, side, f, rr);
+      if(!wasHole && nowHole) given.push({sq: sqAt(f, side, rr), file: f, rr});
+    }
+  }
+  /* Nearest the middle first: a hole on d5 matters and one on a5 usually does
+     not, and naming four squares says less than naming the two that count. */
+  given.sort((x, y) => (Math.abs(3.5 - x.file) - Math.abs(3.5 - y.file)) || (y.rr - x.rr));
+  const named = given.slice(0, 2).map(g => algebraic(g.sq));
+
+  /* Was it the shelter in front of a castled king that just moved? */
+  const k = kingState(before, side);
+  const f = fileOf(move.from);
+  const shelter = k.castled &&
+    ((k.where === 'kingside'  && f >= 5) || (k.where === 'queenside' && f <= 2));
+
+  if(!named.length && !shelter) return null;
+
+  let text;
+  const holes = named.length === 1
+    ? `it gives up ${named[0]} for good — no pawn of yours can ever cover that square again`
+    : `it gives up ${named[0]} and ${named[1]} for good — no pawn of yours can cover either again`;
+  if(named.length && shelter){
+    text = `Pawns do not come back: ${holes}, and it is the cover in front of your own castled king that has gone forward.`;
+  } else if(named.length){
+    text = `Pawns do not come back: ${holes}.`;
+  } else {
+    text = `Pawns do not come back, and that is the cover in front of your own castled king going forward.`;
+  }
+  return {given: named, shelter, text};
+}
+
+function summary(pos){
+  const r = read(pos);
+  return {centre: r.centre,
+          mine:   pos.turn === WHITE ? r.white : r.black,
+          theirs: pos.turn === WHITE ? r.black : r.white};
+}
+
+return {read, forSide, forMove, verdictProse, pushCost, summary,
+        centreState, kingState, isPawnHole};
+})();
+
+</script>
+<script>
+const LEVER_DRILLS = [{"f":"3rrnk1/1p3qpp/p1ppbp2/P3p3/3PP3/4BQ1P/1PPN1PP1/R3R1K1 b - - 0 1","s":"c5","k":"broad-centre-break","t":"held","l":210,"b":"Ng6"},
+{"f":"r1bq1rk1/bpp2ppp/5nn1/NP1pp3/4P3/1BPP1N2/P4PPP/R1BQ1RK1 w - - 0 1","s":"c4","k":"broad-centre-break","t":"topical","l":0,"b":"exd5"},
+{"f":"r2qrnk1/1p4pp/p1ppbp2/4p3/P2PP3/4BN1P/1PP2PP1/R2QR1K1 b - - 0 1","s":"c5","k":"broad-centre-break","t":"held","l":141,"b":"Qc7"},
+{"f":"r3rnk1/1p3qpp/p1ppbp2/P3p3/3PP3/4B2P/1PPN1PP1/R2QR1K1 b - - 0 1","s":"c5","k":"broad-centre-break","t":"held","l":286,"b":"Rad8"},
+{"f":"r3rnk1/1pq3pp/p1ppbp2/P3p3/3PP3/4BN1P/1PP2PP1/R2QR1K1 b - - 0 1","s":"c5","k":"broad-centre-break","t":"held","l":160,"b":"Qf7"},
+{"f":"r1b2rk1/ppp1ppbp/2n3p1/3qP3/3P4/5N2/PPP1B1PP/R1BQK2R w KQ - 0 1","s":"h4","k":"fianchetto-storm","t":"held","l":176,"b":"O-O"},
+{"f":"r1bq1rk1/ppp1ppbp/2n3p1/3nP3/3P4/2N2N2/PPP1B1PP/R1BQK2R w KQ - 0 1","s":"h4","k":"fianchetto-storm","t":"held","l":162,"b":"Nxd5"},
+{"f":"rn1q1rk1/pp1nppbp/3p2p1/2pP4/2P1P3/2N2B1P/PP3PP1/R1BQK2R w KQ - 0 1","s":"h4","k":"fianchetto-storm","t":"topical","l":183,"b":"Be2"},
+{"f":"rn1q1rk1/pp2ppbp/3p1np1/2pP4/2P1P1b1/2N2N2/PP2BPPP/R1BQK2R w KQ - 0 1","s":"h4","k":"fianchetto-storm","t":"topical","l":126,"b":"h3"},
+{"f":"rn1q1rk1/pp2ppbp/3p1np1/2pP4/2P1P3/2N2b1P/PP2BPP1/R1BQK2R w KQ - 0 1","s":"h4","k":"fianchetto-storm","t":"topical","l":0,"b":"Bxf3"},
+{"f":"r1b1q1k1/ppb2pp1/2p2nnp/8/4P3/P1N1BN1P/1PB1QPP1/3rR1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"topical","l":0,"b":"Rxd1"},
+{"f":"r1b1r1k1/pp1nqpp1/2pb1n1p/4p3/3P4/2N1PN1P/PPB2PP1/R1BQR1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"held","l":0,"b":"e4"},
+{"f":"r1b1r1k1/pp1nqppp/2pb1n2/4p3/3P4/2N1PN2/PPB2PPP/R1BQR1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"held","l":0,"b":"h3"},
+{"f":"r1b1r1k1/ppbnqpp1/2p2n1p/4p3/3P4/P1N1PN1P/1PB2PP1/R1BQR1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"topical","l":0,"b":"e4"},
+{"f":"r1b2rk1/pp1nqpp1/2p4p/3p4/3P4/2nBPN2/PPQ2PPP/R4RK1 w - - 0 1","s":"b4","k":"minority-attack","t":"held","l":0,"b":"Qxc3"},
+{"f":"r1b2rk1/pp1nqpp1/2p4p/3p4/3Pn3/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 1","s":"b4","k":"minority-attack","t":"held","l":0,"b":"Qc2"},
+{"f":"r1bq1rk1/pp1n1ppp/2pb1n2/4p3/2BP4/2N1PN2/PP3PPP/R1BQR1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"held","l":0,"b":"Qc2"},
+{"f":"r1bq1rk1/pp1n1ppp/2pbpn2/8/2pP4/2NBPN2/PP3PPP/R1BQR1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"held","l":0,"b":"Bxc4"},
+{"f":"r1bq1rk1/pp1nbpp1/2p2n1p/3p2B1/3P4/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 1","s":"b4","k":"minority-attack","t":"held","l":0,"b":"Bh4"},
+{"f":"r1bq1rk1/pp1nbpp1/2p4p/3p4/3Pn2B/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 1","s":"b4","k":"minority-attack","t":"held","l":0,"b":"Bxe7"},
+{"f":"r1bq1rk1/pp1nbppp/2p2n2/3p2B1/3P4/2NBPN2/PP3PPP/R2QK2R w KQ - 0 1","s":"b4","k":"minority-attack","t":"held","l":0,"b":"h3"},
+{"f":"r1br2k1/ppb1qpp1/2p2n1p/4n3/3NP3/P1N1B2P/1PB2PP1/R2QR1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"topical","l":0,"b":"Qe2"},
+{"f":"r1br2k1/ppb1qpp1/2p2nnp/8/3NP3/P1N1B2P/1PB1QPP1/R3R1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"topical","l":0,"b":"Rad1"},
+{"f":"r1br2k1/ppbnqpp1/2p2n1p/4p3/3PP3/P1N2N1P/1PB2PP1/R1BQR1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"topical","l":0,"b":"Be3"},
+{"f":"r1br2k1/ppbnqpp1/2p2n1p/8/3pP3/P1N1BN1P/1PB2PP1/R2QR1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"topical","l":0,"b":"Nxd4"},
+{"f":"r1brq1k1/ppb2pp1/2p2nnp/8/3NP3/P1N1B2P/1PB1QPP1/3RR1K1 w - - 0 1","s":"b4","k":"minority-attack","t":"topical","l":0,"b":"Qf1"},
+{"f":"3r1r1k/1ppqB1p1/pnn1b2p/4pp2/1P6/P1NP1NP1/4PPBP/1RQ1R1K1 b - - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":1412,"b":"Qxe7"},
+{"f":"3r1r1k/1ppqb1p1/pnn1b2p/2B1pp2/1P6/P1NP1NP1/4PPBP/1RQ1R1K1 w - - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":199,"b":"a4"},
+{"f":"3r1r2/1pp1q1pk/p1n1b2p/3npp2/1P5N/P1NPQ1P1/4PPBP/1R2R1K1 w - - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":0,"b":"Qc1"},
+{"f":"3r1r2/1pp3qk/p1n1b2p/3nppp1/1P6/P1NP1NP1/3QPPBP/1R2R1K1 w - - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":0,"b":"b5"},
+{"f":"3r1rk1/1ppqb1p1/pnn1b2p/2B1pp2/1P6/P1NP1NP1/4PPBP/1RQ1R1K1 b - - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":355,"b":"Nd5"},
+{"f":"r1b1q1k1/ppb2pp1/2p2nnp/8/4P3/P1N1BN1P/1PB1QPP1/3R2K1 b - - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":127,"b":"Qe7"},
+{"f":"r1bq1rk1/pp1nbppp/2n5/4p3/1PPp4/B2P1NP1/P4PBP/RN1QR1K1 b - - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":212,"b":"Bxb4"},
+{"f":"r1bq1rk1/ppp2ppp/2np1n2/2b1p3/1PB1P3/2PP1N2/P4PPP/RNBQ1RK1 b - b3 0 1","s":"a5","k":"rook-pawn","t":"topical","l":751,"b":"Bb6"},
+{"f":"r1bqk2r/1ppnbppp/p1p5/4p3/4P3/5N2/PPPP1PPP/RNBQR1K1 w kq - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":28,"b":"d3"},
+{"f":"r1br2k1/ppb1qpp1/2p2n1p/4n3/3NP3/P1N1B2P/1PB1QPP1/R3R1K1 b - - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":173,"b":"Ng6"},
+{"f":"r1br2k1/ppbnqpp1/2p2n1p/8/3NP3/P1N1B2P/1PB2PP1/R2QR1K1 b - - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":187,"b":"Ne5"},
+{"f":"r2q1rk1/1pp1b1p1/pnn1b2p/4pp2/1P6/P1NPBNP1/4PPBP/1R1Q1RK1 w - - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":0,"b":"Bc5"},
+{"f":"r2q1rk1/1pp1b1p1/pnn1b2p/4pp2/1P6/P1NPBNP1/4PPBP/1R1QR1K1 b - - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":183,"b":"Qd7"},
+{"f":"r2q1rk1/1pp1b1pp/pnn1b3/4pp2/1P6/P1NPBNP1/4PPBP/1R1Q1RK1 b - - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":310,"b":"Nd5"},
+{"f":"r2q1rk1/1pp1bppp/pnn1b3/4p3/1P6/P1NP1NP1/4PPBP/R1BQ1RK1 w - - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":0,"b":"Be3"},
+{"f":"r2q1rk1/1pp1bppp/pnn1b3/4p3/1P6/P1NPBNP1/4PPBP/R2Q1RK1 b - - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":236,"b":"h6"},
+{"f":"r2qk2r/1p2bppB/p1n1p2p/3pP3/3P2P1/P1N2Q1P/1P3P2/R1B1R1K1 b kq - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":509,"b":"Rxh7"},
+{"f":"r2qk2r/1p2bppB/p1n1p2p/3pP3/3P2Pn/P1N2N1P/1P3P2/R1BQR1K1 b kq - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":690,"b":"Nxf3+"},
+{"f":"r2qk2r/1p2bppb/p1n1p2p/3pP3/3P2Pn/P1NB1N1P/1P3P2/R1BQR1K1 w kq - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":0,"b":"Bxh7"},
+{"f":"r2qk2r/1p2bppb/p1n1p2p/3pPn2/3P2P1/P1NB1N1P/1P3P2/R1BQR1K1 b kq g3 0 1","s":"a5","k":"rook-pawn","t":"topical","l":694,"b":"Nh4"},
+{"f":"r2qkb1r/1p2npp1/p1n1p2p/3pPb2/3P4/2N2N2/PP2BPPP/R1BQR1K1 w kq - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":0,"b":"a3"},
+{"f":"r2qkb1r/1p2npp1/p1n1p2p/3pPb2/3P4/P1N2N2/1P2BPPP/R1BQR1K1 b kq - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":156,"b":"Bh7"},
+{"f":"r2qkb1r/1p2nppb/p1n1p2p/3pP3/3P4/P1N2N1P/1P2BPP1/R1BQR1K1 b kq - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":133,"b":"Nf5"},
+{"f":"r2qkb1r/1p3ppb/p1n1p2p/3pPn2/3P4/P1N2N1P/1P2BPP1/R1BQR1K1 w kq - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":0,"b":"Bd3"},
+{"f":"r2qkb1r/1p3ppb/p1n1p2p/3pPn2/3P4/P1NB1N1P/1P3PP1/R1BQR1K1 b kq - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":212,"b":"Be7"},
+{"f":"r3k3/1p2bp1r/p3p2p/1q1pP1pN/1PnP2P1/P3BQ1P/5P2/R1R3K1 b q - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":220,"b":"O-O-O"},
+{"f":"r3k3/1p2bp1r/pq2p2p/3pP1pN/1PnP2P1/P3BQ1P/5P2/R3R1K1 b q - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":122,"b":"O-O-O"},
+{"f":"r3k3/1p2bppr/pq2p2p/3pP3/1PnP2P1/P3BQ1P/4NP2/R3R1K1 w q - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":11,"b":"Rec1"},
+{"f":"r3k3/1p2bppr/pqn1p2p/3pP3/3P2P1/P4Q1P/1P2NP2/R1B1R1K1 w q - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":0,"b":"Be3"},
+{"f":"r3r1k1/2qbbpp1/p2p1n1p/1P2p3/4P2N/1B3Q1P/1PP2PP1/R1B1R1K1 b - - 0 1","s":"a5","k":"rook-pawn","t":"late","l":363,"b":"axb5"},
+{"f":"r4rk1/1ppqb1p1/pnn1b2p/2B1pp2/1P6/P1NP1NP1/4PPBP/1R1QR1K1 b - - 0 1","s":"a5","k":"rook-pawn","t":"topical","l":295,"b":"Rad8"},
+{"f":"rn1q1rk1/1p1npp1p/p2p2p1/2pP4/2PbP3/2N4P/PP2BPP1/R1BQ1RK1 w - - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":266,"b":"a4"},
+{"f":"rnb2rk1/1pq1bppp/p2p4/3np3/2B1P3/5N2/PPP2PPP/R1BQR1K1 w - - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":0,"b":"Bxd5"},
+{"f":"rnbq1rk1/1p2bppp/p2p1n2/2pP4/4P3/2N2N1P/PP3PP1/R1BQKB1R w KQ - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":294,"b":"a4"},
+{"f":"rnbq1rk1/1p2bppp/p2p1n2/4p3/2B1P3/2N2N2/PPP2PPP/R1BQ1RK1 w - - 0 1","s":"a4","k":"rook-pawn","t":"topical","l":3,"b":"Bg5"},
+{"f":"rnbqkb1r/1p3ppp/p2p1n2/4p3/4P3/2N2N2/PPP2PPP/R1BQKB1R w KQkq e6 0 1","s":"a4","k":"rook-pawn","t":"topical","l":19,"b":"Bc4"}]
+;
+</script>
+<script>
 /* vision.js — reading a chess position out of a screenshot.
 
    The job in three stages:
@@ -2333,8 +2886,16 @@ function readSquare(img, grid, r, c, opts){
      we know how far a background pixel strays here, anything well beyond that
      is a piece, whatever the palette.
 
-     Taking the median across the four corners is what survives a rank or file
-     label printed in one of them. */
+     What is wanted is the noise floor of this square's background, so the two
+     quietest corners decide it rather than the median of all four. The median
+     survives a rank or file label printed in ONE corner and no more, and there
+     is one square on every coordinate-labelled board — h1, or whichever corner
+     the app puts both labels in — that carries two. Two loud corners drag the
+     median up, the threshold with it, and the piece standing there vanishes:
+     that was a rook on h1 read as an empty square in twelve of the first
+     twenty-five misreads. Averaging the two quietest corners survives two
+     labels, and the "convincingly different from the square" check below is
+     what stops a floor set this low from turning a gradient into a piece. */
   const cornerNoise = cornerBoxes.map(([sx, sy]) => {
     const ds = [];
     for(let y = sy; y < sy + q; y++) for(let x = sx; x < sx + q; x++){
@@ -2344,7 +2905,8 @@ function readSquare(img, grid, r, c, opts){
     ds.sort((a, b) => a - b);
     return ds.length ? ds[Math.floor(ds.length * 0.90)] : 0;
   });
-  const T = Math.max(10, Math.min(60, 3.0 * median(cornerNoise)));
+  const quiet = cornerNoise.slice().sort((a, b) => a - b);
+  const T = Math.max(10, Math.min(60, 3.0 * (quiet[0] + quiet[1]) / 2));
 
   const raw = new Uint8Array(w*h);
   const lum = new Float32Array(w*h);
@@ -2955,7 +3517,20 @@ async function recognise(src, opts){
      lighter overall can easily be the black one. What does not invert is the
      fill: a piece is called white because the middle of it is light. So the
      groups are formed by whatever separates them most cleanly, and then named
-     by whichever has the lighter core. */
+     by whichever has the lighter core.
+
+     This is still wrong for one family in the test set — an outline-only set,
+     where a white piece has no fill and what shows through its middle is the
+     square, so every white piece standing on a dark square is filed with the
+     black ones. The obvious repair is to measure the core against the square
+     it stands on (coreLum - bgLum) instead of in absolute terms. That was
+     tried, both as an extra splitting statistic and as the naming rule alone,
+     and measured: 188 boards exact -> 181 and 185 respectively. It rescues a
+     little of the outline set and costs more on the grey and thick sets, whose
+     pieces are genuinely close in tone to the squares they stand on. So the
+     absolute core stays, and the outline set stays misread — the correction UI
+     has a "swap the colours" button for exactly this, and one tap fixes a whole
+     board of it. */
   const groupA = occupied.filter(o => o.sq[pick.key] > pick.stat.mid);
   const groupB = occupied.filter(o => o.sq[pick.key] <= pick.stat.mid);
   const coreA = median(groupA.map(o => o.sq.coreLum));
@@ -3295,9 +3870,12 @@ return {parse, looksLikePgn, normaliseSan};
 /* =========================================================================
    CHESS COACH — app logic
 
-   Two ways in, one brain behind both:
+   Four ways in, one brain behind all of them:
      Review   paste a game, walk it move by move, every move explained and
               every mistake named
+     Picture  read a position straight off a screenshot, correct it, analyse it
+     Drill    positions where a thematic pawn move is on the table; decide
+              whether this is the moment, and let the engine settle it
      Board    set up or play any position and ask why a move is good
 
    The annotator runs instantly and says what each move was TRYING to do. The
@@ -3352,6 +3930,12 @@ const state = {
     message: '',
     edited: false,
   },
+  /* The timing drill. Each position is one where a lever's trigger is genuinely
+     present; the question is whether this is the moment, and the engine — not
+     the rules — settles it. Half the set are positions where the thematic move
+     is right and half where it is not, so the answer is never "yes" by habit. */
+  drill: {order: [], i: 0, stage: 'ask', chosen: null, result: null,
+          thinking: false, right: 0, done: 0},
   banner: null,
   tab: 'move',           // 'move' | 'plan'
 };
@@ -3365,6 +3949,7 @@ function posFromFen(fen){ const p = new ChessEngine.Position(ChessEngine.START);
 function view(){
   if(state.mode === 'free') return {fens: state.free.fens, sans: state.free.sans, ply: state.free.fens.length - 1};
   if(state.mode === 'scan') return {fens: [scanFen()], sans: [], ply: 0};
+  if(state.mode === 'drill') return {fens: [drillFen()], sans: [], ply: 0};
   if(!state.game) return {fens: [ChessEngine.START], sans: [], ply: 0};
   return {fens: state.game.fens, sans: state.game.sans, ply: state.ply};
 }
@@ -3436,6 +4021,130 @@ function scanProblems(){
     }
   }
   return out;
+}
+
+/* ---------- the timing drill ---------- */
+
+function drillList(){ return typeof LEVER_DRILLS === 'undefined' ? [] : LEVER_DRILLS; }
+
+function drillCurrent(){
+  const list = drillList();
+  if(!list.length) return null;
+  const d = state.drill;
+  if(!d.order.length){
+    d.order = list.map((_, i) => i);
+    // A fixed shuffle, so the positions do not arrive in the order they were
+    // harvested — which would put every "yes" answer first.
+    for(let i = d.order.length - 1; i > 0; i--){
+      const j = (i * 7 + 3) % (i + 1);
+      [d.order[i], d.order[j]] = [d.order[j], d.order[i]];
+    }
+  }
+  return list[d.order[d.i % d.order.length]];
+}
+
+function drillFen(){
+  const c = drillCurrent();
+  return c ? c.f : ChessEngine.START;
+}
+
+/* Ask the engine what it makes of the thematic move here, and compare. The
+   same method the review uses: search the position after the move and negate,
+   because that is the only way to score one named move honestly. */
+async function answerDrill(playIt){
+  const d = state.drill, c = drillCurrent();
+  if(!c || d.stage !== 'ask' || d.thinking) return;
+  d.thinking = true; d.chosen = playIt; render();
+  try{
+    const before = posFromFen(c.f);
+    const lg = before.legalMoves();
+    const m = lg.find(mm => before.san(mm, lg) === c.s);
+    if(!m) throw new Error('the drill move is not legal in this position');
+
+    const best = await Engine.analyse(c.f, {movetime: 1200});
+    const bestEval = Engine.toWhitePov({cp: best.lines[0].cp, mate: best.lines[0].mate}, before.turn);
+    const after = posFromFen(c.f);
+    after.makeMove(m);
+    const res = await Engine.analyse(after.toFen(), {movetime: 1200, fresh: false});
+    const playedEval = Engine.negate(Engine.toWhitePov(
+      {cp: res.lines[0].cp, mate: res.lines[0].mate}, after.turn));
+    const loss = Math.max(0, Engine.scalar(bestEval) - Engine.scalar(playedEval));
+
+    const uci = best.lines[0].move;
+    const bm = lg.find(mm => mm.from === ChessEngine.fromAlgebraic(uci.slice(0,2))
+                          && mm.to === ChessEngine.fromAlgebraic(uci.slice(2,4)));
+    const bestSan = bm ? before.san(bm, lg) : null;
+    const bestNote = bm ? Annotator.explain(before, bm).short : null;
+
+    const worksHere = loss <= 45;
+    d.result = {loss, bestSan, bestNote, worksHere, correct: playIt === worksHere};
+    d.done++;
+    if(d.result.correct) d.right++;
+    d.stage = 'answered';
+  }catch(e){
+    d.result = {error: 'The engine did not answer: ' + e.message};
+    d.stage = 'answered';
+  }
+  d.thinking = false;
+  render();
+}
+
+function nextDrill(){
+  const d = state.drill;
+  d.i++; d.stage = 'ask'; d.chosen = null; d.result = null;
+  render();
+}
+
+function renderDrill(){
+  if(state.mode !== 'drill') return;
+  const d = state.drill, c = drillCurrent();
+  const q = $('drillQuestion'), btns = $('drillButtons'), out = $('drillResult');
+  if(!c){
+    q.innerHTML = `<p class="hint">No drill positions are built into this copy of the app.</p>`;
+    btns.innerHTML = ''; out.innerHTML = '';
+    return;
+  }
+  const pos = posFromFen(c.f);
+  const item = Levers.forSide(pos, pos.turn).find(i => i.san === c.s);
+  const mover = pos.turn === ChessEngine.WHITE ? 'White' : 'Black';
+  const idea = item ? item.because.join(', and ') : '';
+
+  q.innerHTML = `<h3><span class="mono">${escapeHtml(c.s)}</span> — is this the moment?</h3>` +
+    `<p class="q">${escapeHtml(mover)} to move. <b><span class="mono">${escapeHtml(c.s)}</span></b> ` +
+    `is the thematic move in this structure: ${escapeHtml(idea)}.</p>` +
+    (item && item.waiting.length
+      ? `<p class="hint">Something argues against it: ${escapeHtml(item.waiting.join('; '))}.</p>` : '') +
+    `<p class="hint">Whether that makes it right in this position is a different question, and it is the one to answer.</p>`;
+
+  if(d.stage === 'ask'){
+    btns.innerHTML = d.thinking
+      ? `<span class="hint">Asking the engine…</span>`
+      : `<button class="btn" data-drill="yes">Yes — play ${escapeHtml(c.s)}</button>` +
+        `<button class="btn ghost" data-drill="no">No — something else first</button>`;
+    out.innerHTML = '';
+    return;
+  }
+
+  btns.innerHTML = `<button class="btn" data-drill="next">Next position</button>`;
+  const r = d.result || {};
+  if(r.error){ out.innerHTML = `<div class="verdict wrong"><p>${escapeHtml(r.error)}</p></div>`; return; }
+
+  const cls = r.correct ? 'right' : 'wrong';
+  const head = r.correct ? 'Right' : 'Not this time';
+  let body = r.worksHere
+    ? `<b><span class="mono">${escapeHtml(c.s)}</span> works here.</b> It gives up ` +
+      `${(r.loss/100).toFixed(2)} against the engine's first choice` +
+      (r.bestSan ? ` (<span class="mono">${escapeHtml(r.bestSan)}</span>)` : '') + `, which is nothing.`
+    : `<b><span class="mono">${escapeHtml(c.s)}</span> is not the move here.</b> It costs ` +
+      `${(r.loss/100).toFixed(2)}` +
+      (r.bestSan ? ` — the engine wants <span class="mono">${escapeHtml(r.bestSan)}</span>` : '') + `.`;
+  if(!r.worksHere && r.bestNote) body += ` ${escapeHtml(r.bestNote)}`;
+  body += r.worksHere
+    ? ` The idea and the moment agree.`
+    : ` The idea is still sound — this position just has something more urgent in it, which is exactly what a rule about pawn structure cannot see.`;
+
+  out.innerHTML = `<div class="verdict ${cls}"><h4>${head}</h4><p>${body}</p></div>` +
+                  `<p class="score mono">${d.right} of ${d.done} right</p>`;
 }
 
 async function readImage(src){
@@ -3736,6 +4445,57 @@ function lineText(line, startPly){
    terms, phrased differently per tier so an inaccuracy does not read like a
    disaster.
    --------------------------------------------------------------------------- */
+/* The timing note for a move that has just been played, if it was one of the
+   thematic pawn levers. Returns '' for everything else, which is nearly every
+   move — that is the point of it. */
+function leverBlock(fenBefore, san){
+  if(typeof Levers === 'undefined') return '';
+  try{
+    const before = posFromFen(fenBefore);
+    const lg = before.legalMoves();
+    const m = lg.find(mm => before.san(mm, lg) === san);
+    if(!m) return '';
+    let html = '';
+    const item = Levers.forMove(before, m);
+    if(item){
+      const text = Levers.verdictProse(item);
+      if(text) html += `<div class="lever"><h4>What ${escapeHtml(item.san)} is for</h4>` +
+                       `<p>${escapeHtml(text)}</p></div>`;
+    }
+    /* The one thing true of every pawn move, whether or not it is thematic:
+       what it gives up that cannot be taken back. */
+    const cost = Levers.pushCost(before, m);
+    if(cost) html += `<div class="lever cost"><h4>What it costs for good</h4>` +
+                     `<p>${escapeHtml(cost.text)}</p></div>`;
+    return html;
+  }catch(e){ return ''; }
+}
+
+/* What the structure on the board is asking for, without recommending a move.
+   Shown in the plan tab; silent unless a lever's trigger is actually present. */
+function leverPlan(fen){
+  if(typeof Levers === 'undefined') return '';
+  try{
+    const pos = posFromFen(fen);
+    const s = Levers.summary(pos);
+    const rows = [];
+    for(const [who, list] of [['You', s.mine], ['They', s.theirs]]){
+      for(const it of list){
+        const label = who === 'You' ? 'For you' : 'For them';
+        rows.push(`<li><b>${label}: <span class="mono">${escapeHtml(it.san)}</span></b> — ` +
+                  `${escapeHtml(it.because.join(', and '))}.` +
+                  (it.waiting.length ? ` <span class="why-alt">Against it right now: ${escapeHtml(it.waiting.join('; '))}.</span>` : '') +
+                  (it.cost.length ? ` <span class="why-alt">It costs: ${escapeHtml(it.cost.join('; '))}.</span>` : '') +
+                  `</li>`);
+      }
+    }
+    if(!rows.length) return '';
+    return `<h3>Pawn levers in this structure</h3><ul class="plan-list">${rows.join('')}</ul>` +
+           `<p class="hint">These are the thematic pawn moves the structure suggests, not recommendations — ` +
+           `whether one works here is what the engine is for.</p>`;
+  }catch(e){ return ''; }
+}
+
 function whyBlock(ver, i){
   if(!ver) return '';
   const key = ver.verdict.key;
@@ -3817,12 +4577,14 @@ function render(){
   renderPlan();
   renderControls();
   renderScan();
+  renderDrill();
   renderBanner();
 }
 
 function renderModeTabs(){
   const el = $('modeTabs');
-  el.innerHTML = [['review','Review a game'], ['scan','From a picture'], ['free','Free board']]
+  el.innerHTML = [['review','Review a game'], ['scan','From a picture'],
+                  ['drill','Timing drill'], ['free','Free board']]
     .map(([k,label]) => `<button class="tab${state.mode===k?' active':''}" data-mode="${k}">${label}</button>`).join('');
 }
 
@@ -3841,6 +4603,12 @@ function renderHeader(){
     const op = openingAt(v.fens, v.ply);
     el.innerHTML = `<h2>Free board</h2><p class="hint">Play any legal move for either side, then read what it does. ${
       op ? `Right now this is the <b>${escapeHtml(op.name)}</b> <span class="mono">${op.eco}</span>.` : ''}</p>`;
+    return;
+  }
+  if(state.mode === 'drill'){
+    el.innerHTML = `<h2>Timing drill</h2><p class="hint">Each position is one where a thematic ` +
+      `pawn move is genuinely on the table. The question is never whether the idea is right — ` +
+      `it is whether this is the moment, and the engine settles that.</p>`;
     return;
   }
   if(state.mode === 'scan'){
@@ -3916,8 +4684,9 @@ const VERDICT_MARK = {best:'', good:'', inaccuracy:'?!', mistake:'?', blunder:'?
 function renderRibbon(){
   const el = $('ribbon');
   const v = view();
-  // There is no move list when a position has simply been read off a picture.
-  if(state.mode === 'scan'){ el.innerHTML = ''; return; }
+  // There is no move list when a position has simply been read off a picture,
+  // or when a single drill position is on the board.
+  if(state.mode === 'scan' || state.mode === 'drill'){ el.innerHTML = ''; return; }
   if(!v.sans.length){
     el.innerHTML = `<button class="empty" disabled>${state.mode==='free' ? 'Tap a piece to begin.' : 'No game loaded yet.'}</button>`;
     return;
@@ -3950,6 +4719,12 @@ function renderExplain(){
   const el = $('panel-move');
   const v = view();
 
+  if(state.mode === 'drill'){
+    el.innerHTML = `<p class="hint">The question is below the board. These rules describe what a ` +
+      `pawn move is for; they cannot see tactics, and half of these positions have something more ` +
+      `urgent in them than the plan. Telling those apart is the skill.</p>`;
+    return;
+  }
   if(state.mode === 'scan'){
     if(state.scan.stage !== 'ready'){
       el.innerHTML = `<p class="hint">Once a picture has been read, the position appears on the board for you to check.</p>`;
@@ -4003,6 +4778,13 @@ function renderExplain(){
   if(ver) html += ` <span class="badge v-${ver.verdict.key}">${ver.verdict.label}</span>`;
   html += `</h3>`;
   html += `<p class="say">${escapeHtml(note ? note.text : '')}</p>`;
+
+  /* If the move was one of the thematic pawn levers, say what it was for. This
+     goes ABOVE the engine's verdict on purpose: the two answer different
+     questions, and a move whose idea is right and whose moment is wrong is one
+     of the most instructive things a game can show you — but only if you can
+     see both halves at once. */
+  html += leverBlock(state.game.fens[i], state.game.sans[i]);
 
   if(ver){
     const cost = costText(ver);
@@ -4075,6 +4857,7 @@ function renderPlan(){
   if(!shared.length && !forSide(ChessEngine.WHITE).length && !forSide(ChessEngine.BLACK).length)
     html += `<p class="hint">Nothing has settled yet — no weak pawns, no open files, both kings fine. Develop, castle, and let the position declare itself.</p>`;
 
+  html += leverPlan(v.fens[v.ply]);
   html += `<p class="hint" style="margin-top:1rem">This reads the position on the board, not an opening book — it updates as you step through the game.</p>`;
   el.innerHTML = html;
 }
@@ -4097,13 +4880,14 @@ function renderTabs(){
 function renderControls(){
   $('reviewTools').hidden = state.mode !== 'review';
   $('freeTools').hidden = state.mode !== 'free';
+  $('drillTools').hidden = state.mode !== 'drill';
   $('scanInput').hidden = state.mode !== 'scan' || state.scan.stage === 'ready';
   $('scanEdit').hidden  = state.mode !== 'scan' || state.scan.stage !== 'ready';
   /* Stepping back and forth through a game, and flipping the view, mean nothing
      while a single position is being checked — and a second flip control next
      to "Turn the board round" would only muddle what that one does. */
-  const stepper = document.querySelector('.controls');
-  if(stepper) stepper.hidden = state.mode === 'scan';
+  const stepper = $('stepControls');
+  if(stepper) stepper.hidden = state.mode === 'scan' || state.mode === 'drill';
   const atStart = state.mode==='review' && state.ply === 0;
   const atEnd   = state.mode==='review' && state.game && state.ply >= state.game.sans.length;
   if($('btnPrev')) $('btnPrev').disabled = state.mode==='review' ? atStart
@@ -4283,6 +5067,11 @@ function wire(){
   });
 
   /* ---- reading a position off a picture ---- */
+  $('drillButtons').addEventListener('click', e => {
+    const b = e.target.closest('[data-drill]'); if(!b) return;
+    if(b.dataset.drill === 'next') nextDrill();
+    else answerDrill(b.dataset.drill === 'yes');
+  });
   $('btnPickImage').addEventListener('click', () => $('fileImage').click());
   $('fileImage').addEventListener('change', e => {
     const f = e.target.files && e.target.files[0];

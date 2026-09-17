@@ -172,8 +172,23 @@ public class MainActivity extends Activity {
 
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             bmp.compress(Bitmap.CompressFormat.PNG, 100, out);
+
+            /* The data URL is handed over by evaluating a string of JavaScript,
+             * and a very large string is exactly where that becomes unreliable
+             * across devices. A busy screenshot can still make a big PNG even
+             * after scaling, so past a sane size fall back to a high-quality
+             * JPEG. The recogniser measures its threshold from each square's own
+             * corners, so mild JPEG noise costs it very little — whereas a
+             * picture that never arrives costs everything. */
+            String mime = "image/png";
+            if (out.size() > 1200000) {
+                ByteArrayOutputStream jpg = new ByteArrayOutputStream();
+                bmp.compress(Bitmap.CompressFormat.JPEG, 92, jpg);
+                out = jpg;
+                mime = "image/jpeg";
+            }
             bmp.recycle();
-            return "data:image/png;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP);
+            return "data:" + mime + ";base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP);
         } catch (Exception e) {
             return null;
         } catch (OutOfMemoryError e) {

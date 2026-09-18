@@ -381,6 +381,7 @@
 .banner.ok{background:var(--ok-bg,#DDEBD4);color:var(--ink)}
 .banner.bad{background:var(--bad-bg,#F4DCDA);color:var(--ink)}
 .badge.v-best,.badge.v-good{background:#DDEBD4;color:#2E4A28}
+.badge.v-excellent{background:#BFE0AE;color:#23401C;font-weight:700}
 .badge.v-inaccuracy{background:#F3E2B0;color:#5A4718}
 .badge.v-mistake{background:#EFC470;color:#5A3C10}
 .badge.v-blunder,.badge.v-missed{background:#E28B90;color:#4A1B1E}
@@ -391,6 +392,14 @@
 .why h4{margin:0 0 .35rem;font-size:.92rem}
 .why p{margin:0;font-size:.95rem;line-height:1.6}
 .why.v-best,.why.v-good{border-left-color:#6E8F5E}
+.why.v-excellent{border-left-color:#3F6B2E;border-left-width:4px}
+.history-ribbon .v-excellent{color:#3F6B2E;font-weight:600}
+.next{margin-top:.85rem;padding:.65rem .75rem;border-radius:10px;background:var(--panel-2);
+  border-left:3px solid var(--ink-faint)}
+.next h4{margin:0 0 .35rem;font-size:.92rem;color:var(--ink-soft)}
+.next p{margin:0;font-size:.95rem;line-height:1.6}
+.next .line{margin-top:.5rem;font-size:.85rem;color:var(--ink-soft);
+  overflow-wrap:anywhere;line-height:1.5}
 .why.v-inaccuracy{border-left-color:#C79A5D}
 .why.v-mistake{border-left-color:#D9843C}
 .why.v-blunder,.why.v-missed{border-left-color:#B44A50}
@@ -534,8 +543,15 @@
         <button class="btn ghost" id="btnNext">Next ›</button>
         <button class="btn ghost" id="btnFlip">⇅ Flip board</button>
       </div>
+      <div id="sideBlock" class="scan-block" hidden>
+        <h4>Which colour are you playing?</h4>
+        <div class="seg" id="sideRow"></div>
+        <p class="scan-note">Your colour sits at the bottom of the board, and every
+          plan and evaluation below is written from your side of it.</p>
+      </div>
+
       <div id="freeTools" class="controls" hidden>
-        <button class="btn" id="btnEngineHere">What does the engine think?</button>
+        <button class="btn" id="btnEngineHere">Think again, harder</button>
         <button class="btn ghost" id="btnResetFree">Reset board</button>
       </div>
 
@@ -2341,6 +2357,230 @@ return {read, forSide, forMove, verdictProse, pushCost, summary,
 
 </script>
 <script>
+/* ---------------------------------------------------------------------------
+   WHAT HAPPENS NEXT, IN WORDS
+
+   The engine already tells you where a position is going: it hands back a
+   principal variation, a best-play line several moves deep. The trouble is that
+   it hands it back as "Nf6 d4 Nxe4 Nxe5 Nc6", which is exactly as useful to
+   someone learning as a wiring diagram is to someone who wants the light on.
+
+   This module replays that line on a real board and says what happens in
+   English. Every clause it produces comes from a move it actually made: the
+   piece names come from the board it moved them on, a capture is named only
+   where a piece was really taken, "castles" is said only where the move carried
+   the castling flag, and the material at the end is counted, not guessed.
+   Nothing here evaluates anything or offers an opinion about the position —
+   that is the engine's job, and mixing the two is how an app ends up stating
+   confident nonsense. This is a narrator, not a second opinion.
+
+   The one thing it deliberately does NOT do is call something "hanging" at the
+   end of the line. A piece left en prise at a principal variation's last ply is
+   almost always the search horizon rather than a real gift, and saying so out
+   loud would be inventing chess the engine never claimed.
+   --------------------------------------------------------------------------- */
+const Plan = (function(){
+'use strict';
+
+const E = ChessEngine;
+
+const NAME = {P:'pawn', N:'knight', B:'bishop', R:'rook', Q:'queen', K:'king'};
+const VAL  = {P:1, N:3, B:3, R:5, Q:9, K:0};
+const FILES = 'abcdefgh';
+
+/* Three full moves is what gets narrated. It is the depth that was asked for,
+   and it is also about as much as anyone can hold in their head from prose. */
+const PLIES = 6;
+
+const other = c => (c === E.WHITE ? E.BLACK : E.WHITE);
+const colourName = c => (c === E.WHITE ? 'White' : 'Black');
+
+function posFrom(fen){
+  const p = new E.Position(E.START);
+  p.loadFen(fen);
+  return p;
+}
+
+function toMove(pos, uci){
+  if(!uci || uci.length < 4) return null;
+  const from = E.fromAlgebraic(uci.slice(0, 2));
+  const to   = E.fromAlgebraic(uci.slice(2, 4));
+  const promo = uci.length > 4 ? uci[4].toUpperCase() : null;
+  return pos.legalMoves().find(m =>
+    m.from === from && m.to === to && (m.promotion || null) === (promo || null)) || null;
+}
+
+/* Material from one side's point of view, in pawns. */
+function material(pos, side){
+  let mine = 0, yours = 0;
+  for(let i = 0; i < 64; i++){
+    const p = pos.board[i];
+    if(!p) continue;
+    const v = VAL[E.type(p)];
+    if(E.color(p) === side) mine += v; else yours += v;
+  }
+  return mine - yours;
+}
+
+function amountName(n){
+  const a = Math.abs(n);
+  if(a >= 9) return 'a queen';
+  if(a >= 5) return 'a rook';
+  if(a >= 4) return 'a rook for a pawn';
+  if(a === 3) return 'a piece';
+  if(a === 2) return 'two pawns';
+  return 'a pawn';
+}
+
+/* ---------------------------------------------------------------------------
+   Replaying the line. Everything the narrator is allowed to say is recorded
+   here, at the moment the move is made, from the board it is made on.
+   --------------------------------------------------------------------------- */
+function walk(fen, uciLine, maxPlies){
+  const pos = posFrom(fen);
+  const steps = [];
+  for(const u of (uciLine || []).slice(0, maxPlies)){
+    const legal = pos.legalMoves();
+    const m = toMove(pos, u);
+    if(!m) break;
+    const san = pos.san(m, legal);
+    // en passant takes a pawn that is not standing on the destination square
+    const captured = m.ep ? 'P' : (pos.board[m.to] ? E.type(pos.board[m.to]) : null);
+    const step = {
+      san, side: pos.turn, piece: m.piece, from: m.from, to: m.to,
+      sqFrom: E.algebraic(m.from), sqTo: E.algebraic(m.to),
+      captured, castle: m.castle || null, promotion: m.promotion || null,
+    };
+    pos.makeMove(m);
+    step.check = pos.inCheck(pos.turn);
+    step.mate  = step.check && pos.legalMoves().length === 0;
+    steps.push(step);
+    if(step.mate) break;
+  }
+  return {steps, end: pos};
+}
+
+/* One move as a clause with a third-person verb, so clauses chain into a
+   sentence: "Black takes the knight on d5, White takes back with the queen". */
+function clause(step, prev){
+  if(step.castle) return step.castle === 'Q' ? 'castles long' : 'castles';
+
+  if(step.captured){
+    const retake = prev && prev.captured && prev.to === step.to;
+    if(retake) return `takes back with the ${NAME[step.piece]}`;
+    return `takes the ${NAME[step.captured]} on ${step.sqTo}`;
+  }
+
+  if(step.promotion){
+    return `pushes the ${FILES[E.fileOf(step.from)]}-pawn to ${step.sqTo} and makes a ${NAME[step.promotion]}`;
+  }
+
+  if(step.piece === 'P'){
+    return `pushes the ${FILES[E.fileOf(step.from)]}-pawn to ${step.sqTo}`;
+  }
+
+  return `brings the ${NAME[step.piece]} to ${step.sqTo}`;
+}
+
+function joinClauses(list){
+  if(list.length === 1) return list[0];
+  if(list.length === 2) return list[0] + ', and ' + list[1];
+  return list.slice(0, -1).join(', ') + ', and ' + list[list.length - 1];
+}
+
+/* Where the engine says the position stands, from the mover's point of view.
+   This is the outcome sentence, and it has to be, because material counted over
+   six plies is NOT the outcome: a line can hand the mover a knight inside the
+   window and still be losing, and the first draft of this file cheerfully wrote
+   "Black comes out two pawns up" underneath a move it had just called a blunder
+   at +8.56 for White. Both facts were true. Putting only the material one in
+   the closing sentence made the app contradict itself. */
+function standing(evalFromMover, usName, themName){
+  if(!evalFromMover) return null;
+  const mate = evalFromMover.mate;
+  if(mate !== null && mate !== undefined){
+    if(mate > 0) return `${usName} has a forced mate`;
+    if(mate < 0) return `${themName} has a forced mate`;
+  }
+  const cp = evalFromMover.cp || 0;
+  if(cp >=  300) return `${usName} is winning`;
+  if(cp >=  100) return `${usName} is clearly better`;
+  if(cp >=   50) return `${usName} is a little better`;
+  if(cp >   -50) return `the position stays about level`;
+  if(cp >  -100) return `${themName} is a little better`;
+  if(cp >  -300) return `${themName} is clearly better`;
+  return `${themName} is winning`;
+}
+
+/* ---------------------------------------------------------------------------
+   narrate(fen, uciLine, mover, evalFromMover)
+
+   `fen` is the position AFTER the move being explained, so the line starts with
+   the opponent's reply. `mover` is the side who just played, and
+   `evalFromMover` is the engine's score for that position from their point of
+   view. Returns null when there is no line to replay — an empty plan is better
+   than a made-up one.
+   --------------------------------------------------------------------------- */
+function narrate(fen, uciLine, mover, evalFromMover){
+  if(!uciLine || !uciLine.length) return null;
+
+  let w, before;
+  try{
+    before = posFrom(fen);
+    w = walk(fen, uciLine, PLIES);
+  }catch(e){ return null; }
+  if(!w.steps.length) return null;
+
+  const them = other(mover);
+  const usName = colourName(mover), themName = colourName(them);
+  const nameFor = side => (side === mover ? usName : themName);
+
+  /* Clauses, grouped so the prose has a shape: the immediate exchange first,
+     then how it plays out. */
+  const parts = w.steps.map((s, i) => `${nameFor(s.side)} ${clause(s, i ? w.steps[i-1] : null)}`);
+
+  const sentences = [];
+  sentences.push(joinClauses(parts.slice(0, 2)) + '.');
+  if(parts.length > 2) sentences.push('Then ' + joinClauses(parts.slice(2)) + '.');
+
+  /* Where it lands. Two separate facts, said separately and each scoped to what
+     it actually covers: material counted off the final board of the narrated
+     window, and the engine's verdict on the whole position. */
+  const net = material(w.end, mover) - material(before, mover);
+  const last = w.steps[w.steps.length - 1];
+
+  if(last.mate){
+    sentences.push(`${nameFor(last.side)} is mated at the end of it.`);
+  } else {
+    const span = `${w.steps.length >= 6 ? 'Three moves in' : 'By the end of that'}`;
+    const mat = net > 0 ? `${usName} is ${amountName(net)} up on material`
+              : net < 0 ? `${usName} is ${amountName(net)} down on material`
+              :           `material is still level`;
+    const where = standing(evalFromMover, usName, themName);
+    sentences.push(`${span}, ${mat}` + (where ? `, and the engine has it that ${where}.` : '.'));
+
+    // Castling is the one plan-level fact in a quiet line worth naming.
+    if(w.steps.some(s => s.castle && s.side === mover))
+      sentences.push(`${usName} gets the king out of the middle along the way.`);
+  }
+
+  return {
+    text: sentences.join(' '),
+    plies: w.steps.length,
+    fullMoves: Math.floor(w.steps.length / 2),
+    net,
+    // kept for the tests: every claim above is checkable against these
+    steps: w.steps.map(s => ({san: s.san, side: s.side, piece: s.piece, sqTo: s.sqTo,
+                              captured: s.captured, castle: s.castle, check: s.check, mate: s.mate})),
+    endFen: null,
+  };
+}
+
+return {narrate, walk, material, PLIES};
+})();
+
+</script>
+<script>
 const LEVER_DRILLS = [{"f":"3rrnk1/1p3qpp/p1ppbp2/P3p3/3PP3/4BQ1P/1PPN1PP1/R3R1K1 b - - 0 1","s":"c5","k":"broad-centre-break","t":"held","l":210,"b":"Ng6"},
 {"f":"r1bq1rk1/bpp2ppp/5nn1/NP1pp3/4P3/1BPP1N2/P4PPP/R1BQ1RK1 w - - 0 1","s":"c4","k":"broad-centre-break","t":"topical","l":0,"b":"exd5"},
 {"f":"r2qrnk1/1p4pp/p1ppbp2/4p3/P2PP3/4BN1P/1PP2PP1/R2QR1K1 b - - 0 1","s":"c5","k":"broad-centre-break","t":"held","l":141,"b":"Qc7"},
@@ -3917,7 +4157,8 @@ const state = {
   analysisToken: 0,      // bumped on every load; retires any run still in flight
   flipped: false,
   // free board
-  free: {sans: [], fens: [ChessEngine.START], selected: null, targets: [], promo: null, thinking: false, engineLines: null},
+  free: {sans: [], fens: [ChessEngine.START], selected: null, targets: [], promo: null, thinking: false,
+        engineLines: null, side: ChessEngine.WHITE, plan: null, planEval: null, planLine: null},
   // reading a position off a picture
   scan: {
     stage: 'idle',       // idle | reading | ready | failed
@@ -4215,8 +4456,12 @@ function analyseScan(){
   s.problems = scanProblems();
   if(s.problems.length){ render(); return; }
   const fen = scanFen();
+  /* Whoever is to move in the scanned position is taken to be the person
+     holding the phone — they photographed the board because it is their turn. */
   state.free = {sans: [], fens: [fen], selected: null, targets: [], promo: null,
-                thinking: false, engineLines: null};
+                thinking: false, engineLines: null, side: posFromFen(fen).turn,
+                plan: null, planEval: null, planLine: null};
+  state.flipped = state.free.side === ChessEngine.BLACK;
   state.mode = 'free';
   state.banner = {tone: 'ok', text: 'Position loaded. Play moves from here, or read the plan on the right.'};
   render();
@@ -4231,9 +4476,27 @@ const VERDICTS = [
   {key:'mistake',    label:'Mistake',     max: 200},
   {key:'blunder',    label:'Blunder',     max: Infinity},
 ];
+const EXCELLENT = {key:'excellent', label:'Excellent', max: 10};
+
+/* How far the best move has to beat its nearest rival before finding it counts
+   as an achievement rather than a coin toss. A pawn and a half is the point
+   where the alternatives stop being playable. */
+const ONLY_MOVE_CP = 150;
+
 function classify(lossCp){
   for(const v of VERDICTS) if(lossCp <= v.max) return v;
   return VERDICTS[VERDICTS.length-1];
+}
+
+/* "Excellent" is not a louder word for "best". Most best moves are obvious:
+   several moves hold the position and the engine picks one. This marks the
+   other kind — where one move works and the rest measurably do not, so playing
+   it required seeing something. The test is the gap to the SECOND best move,
+   which is a number the engine hands us, not a judgement about difficulty that
+   nothing here could support. With only one legal move there is no second line
+   and no credit: being forced is not the same as finding it. */
+function isExcellent(loss, onlyMoveGap){
+  return loss <= EXCELLENT.max && onlyMoveGap !== null && onlyMoveGap >= ONLY_MOVE_CP;
 }
 function evalText(ev){
   if(!ev) return '';
@@ -4316,12 +4579,23 @@ async function runAnalysis(token){
       const playedUci = ChessEngine.algebraic(played.from) + ChessEngine.algebraic(played.to) +
                         (played.promotion ? played.promotion.toLowerCase() : '');
 
-      // What was best here? Reported from the mover's point of view.
-      const res = await Engine.analyse(g.fens[i], {movetime});
+      /* What was best here? Reported from the mover's point of view.
+
+         MultiPV 2 costs a little search time and buys the one thing a single
+         line cannot tell you: whether the best move was the ONLY move. A move
+         that beats its nearest rival by a pawn and a half was a move worth
+         finding; the same move in a position where three others do just as well
+         was not. That difference is what separates "excellent" from "fine", and
+         without the second line there is no honest way to draw it. */
+      const res = await Engine.analyse(g.fens[i], {movetime, multipv: 2});
       if(state.analysisToken !== token){ state.analysing = false; return; }
       const bestLine = res.lines[0];
       if(!bestLine) continue;
       const bestEval = {cp: bestLine.cp, mate: bestLine.mate};
+      const runnerUp = res.lines[1] || null;
+      const onlyMoveGap = runnerUp
+        ? Math.max(0, Engine.scalar(bestEval) - Engine.scalar({cp: runnerUp.cp, mate: runnerUp.mate}))
+        : null;
 
       // How good was the move actually played? Search the position AFTER it and
       // negate. This is the only trustworthy way round: asking the engine to
@@ -4346,6 +4620,7 @@ async function runAnalysis(token){
       const loss = Math.max(0, Engine.scalar(bestEval) - Engine.scalar(playedEval));
 
       let verdict = classify(loss);
+      if(isExcellent(loss, onlyMoveGap)) verdict = EXCELLENT;
       const bestIsMate   = bestEval.mate !== null && bestEval.mate !== undefined && bestEval.mate > 0;
       const playedIsMate = playedEval.mate !== null && playedEval.mate !== undefined && playedEval.mate > 0;
       if(bestIsMate && !playedIsMate) verdict = {key:'missed', label:'Missed mate', max:0};
@@ -4366,9 +4641,17 @@ async function runAnalysis(token){
         loss, verdict, bestSan, bestNote,
         evalAfter: Engine.toWhitePov(playedEval, mover),
         depth: bestLine.depth,
-        refutationSan: refutation ? uciLineToSan(g.fens[i+1], refutation, 6) : null,
-        bestLineSan:   bestLine.pv ? uciLineToSan(g.fens[i], bestLine.pv, 5) : null,
+        /* Eight plies, not six: the ask is to see at least three full moves
+           ahead, and a line is trimmed by whatever fails to replay, so the
+           request has to start above the promise. */
+        refutationSan: refutation ? uciLineToSan(g.fens[i+1], refutation, 8) : null,
+        bestLineSan:   bestLine.pv ? uciLineToSan(g.fens[i], bestLine.pv, 8) : null,
         swing: materialSwing(g.fens[i+1], refutation, mover),
+        // What happens over the next few moves, in words rather than notation.
+        plan: (typeof Plan !== 'undefined' && refutation)
+                ? Plan.narrate(g.fens[i+1], refutation, mover, playedEval) : null,
+        onlyMoveGap,
+        runnerUpSan: runnerUp && runnerUp.move ? sanOf(g.fens[i], runnerUp.move) : null,
         mover,
       };
       renderProgress(i + 1, g.sans.length);
@@ -4380,6 +4663,30 @@ async function runAnalysis(token){
   if(state.analysisToken !== token) return;
   renderProgress(g.sans.length, g.sans.length);
   render();
+}
+
+/* Which ply a position is at, taken from the FEN's own move number rather than
+   from how many moves this session happens to have played. The free board can
+   start anywhere — a scanned photograph is usually move twenty-something — and
+   numbering a line from zero there produces "1…Nxe4 1.Bd5", which is not a move
+   number, it is two of them. The parity matters as much as the count: an odd
+   ply means Black is to move, and that is what puts the dots on the right side
+   of the number. */
+function plyFromFen(fen){
+  const parts = String(fen || '').split(/\s+/);
+  const full = Math.max(1, parseInt(parts[5], 10) || 1);
+  const blackToMove = parts[1] === 'b';
+  return (full - 1) * 2 + (blackToMove ? 1 : 0);
+}
+
+/* One UCI move as SAN in the given position, or null if it will not replay. */
+function sanOf(fen, uci){
+  try{
+    const pos = posFromFen(fen);
+    const legal = pos.legalMoves();
+    const m = uciToMove(pos, uci);
+    return m ? pos.san(m, legal) : null;
+  }catch(e){ return null; }
 }
 
 /* Turn a UCI principal variation into readable SAN, numbered from wherever it
@@ -4505,12 +4812,29 @@ function whyBlock(ver, i){
   const swing = ver.swing || 0;
   let head, body = '';
 
+  /* Excellent gets its own reason, and the reason is the whole point of the
+     tier: not that the engine agreed, but that nothing else came close. The gap
+     to the second-best move is quoted because that is the actual evidence. */
+  if(key === 'excellent'){
+    head = 'Why it’s excellent';
+    const gap = (ver.onlyMoveGap / 100).toFixed(1);
+    const alt = ver.runnerUpSan
+      ? `the next best was <span class="mono">${escapeHtml(ver.runnerUpSan)}</span>, and that comes out ${gap} worse`
+      : `every other move comes out at least ${gap} worse`;
+    body = `This was not one of several moves that all work — it was the move. ` +
+           `The engine's second choice falls short by a clear margin: ${alt}. ` +
+           `Finding it is what kept the position where it is.`;
+    return {head, body};
+  }
+
   if(key === 'best' || key === 'good'){
     head = key === 'best' ? 'Why it’s the best move' : 'Why it holds up';
     const line = ver.bestLineSan ? lineText(ver.bestLineSan, i) : null;
     body = line
       ? `Nothing the opponent has changes the assessment — the engine expects <span class="mono">${escapeHtml(line)}</span>, and the evaluation barely moves.`
       : `The engine finds nothing better, and no reply changes the assessment.`;
+    if(key === 'best' && ver.onlyMoveGap !== null && ver.onlyMoveGap !== undefined && ver.onlyMoveGap < 30)
+      body += ` It was not the only move that works, though — the engine's second choice is just as playable.`;
     if(key === 'good' && ver.loss >= 15)
       body += ` It gives up ${(ver.loss/100).toFixed(2)} against the very best move, which is well inside the margin that decides games at club level.`;
     return {head, body};
@@ -4737,25 +5061,61 @@ function renderExplain(){
   }
 
   if(state.mode === 'free'){
-    if(!v.sans.length){
-      el.innerHTML = `<p class="hint">Play a move and it gets explained here. Then press <b>What does the engine think?</b> to see the three moves it likes best in this position, each one in plain words.</p>`;
+    const f = state.free;
+    const me = f.side === ChessEngine.WHITE ? 'White' : 'Black';
+    let html = '';
+
+    // the move just played, if any
+    if(v.sans.length){
+      const i = v.sans.length - 1;
+      const before = posFromFen(v.fens[i]);
+      const lg = before.legalMoves();
+      const m = lg.find(mm => before.san(mm, lg) === v.sans[i]);
+      const note = m ? Annotator.explain(before, m) : null;
+      html += `<h3><span class="mono">${escapeHtml(v.sans[i])}</span></h3>` +
+              `<p class="say">${escapeHtml(note ? note.text : '')}</p>`;
+    }
+
+    const here = posFromFen(v.fens[v.ply]);
+    const over = !here.legalMoves().length;
+    if(over){
+      html += `<p class="say">${here.inCheck(here.turn)
+                ? 'Checkmate — the game is over, so there is nothing left to plan.'
+                : 'Stalemate — the game is drawn, so there is nothing left to plan.'}</p>`;
+      el.innerHTML = html;
       return;
     }
-    const i = v.sans.length - 1;
-    const before = posFromFen(v.fens[i]);
-    const lg = before.legalMoves();
-    const m = lg.find(mm => before.san(mm, lg) === v.sans[i]);
-    const note = m ? Annotator.explain(before, m) : null;
-    let html = `<h3>${escapeHtml(v.sans[i])}</h3><p class="say">${escapeHtml(note ? note.text : '')}</p>`;
-    if(state.free.thinking) html += `<p class="hint">Thinking…</p>`;
-    if(state.free.engineLines){
-      html += `<h3 style="margin-top:1rem">What the engine likes here</h3><div class="alt-list">`;
-      for(const line of state.free.engineLines){
+
+    if(f.thinking) html += `<p class="hint">Working out your plan…</p>`;
+
+    /* The plan, from the chosen colour's side of the board. */
+    if(f.plan && f.plan.text){
+      const lead = f.planYours
+        ? (f.planFirstSan
+            ? `It is your move. The engine would play <span class="mono">${escapeHtml(f.planFirstSan)}</span>, and from there:`
+            : `It is your move, and from here:`)
+        : `It is their move. Best play from both sides runs:`;
+      html += `<div class="next"><h4>Your plan as ${me} — the next ${f.plan.fullMoves >= 3 ? 'three moves' : 'few moves'}</h4>` +
+              `<p>${lead}</p>` +
+              `<p style="margin-top:.4rem">${escapeHtml(f.plan.text)}</p>`;
+      const lineStr = f.planLine ? lineText(f.planLine, plyFromFen(v.fens[v.ply])) : '';
+      if(lineStr) html += `<p class="line mono">${escapeHtml(lineStr)}</p>`;
+      html += `</div>`;
+      if(f.planEval)
+        html += `<p class="hint mono">Position for ${me}: ${escapeHtml(evalText(f.planEval))}</p>`;
+    }
+
+    if(f.engineLines && f.engineLines.length){
+      html += `<h3 style="margin-top:1rem">The moves it likes here</h3>` +
+              `<p class="hint">Scored for ${me} — a plus means good for you.</p><div class="alt-list">`;
+      for(const line of f.engineLines){
         html += `<div class="alt-row"><b class="mono">${escapeHtml(line.san)}</b> <span class="mono ev">${escapeHtml(line.ev)}</span>` +
                 `<span class="g-why">${escapeHtml(line.text)}</span></div>`;
       }
       html += `</div>`;
     }
+
+    if(!html) html = `<p class="hint">Pick your colour above, then play a move. The plan for your side appears here on its own after every move.</p>`;
     el.innerHTML = html;
     return;
   }
@@ -4795,7 +5155,20 @@ function renderExplain(){
     const why = whyBlock(ver, i);
     if(why) html += `<div class="why v-${ver.verdict.key}"><h4>${why.head}</h4><p>${why.body}</p></div>`;
 
-    if(ver.bestSan && ver.bestSan !== state.game.sans[i] && ver.verdict.key !== 'best' && ver.verdict.key !== 'good'){
+    /* The engine's own continuation, three full moves of it, in words. The
+       notation is kept underneath rather than dropped: the prose is for
+       understanding it, the notation is for checking it and for playing it out
+       on a board. */
+    if(ver.plan && ver.plan.text){
+      html += `<div class="next"><h4>What happens over the next ${ver.plan.fullMoves >= 3 ? 'three moves' : 'moves'}</h4>` +
+              `<p>${escapeHtml(ver.plan.text)}</p>`;
+      const line = ver.refutationSan ? lineText(ver.refutationSan, i + 1) : '';
+      if(line) html += `<p class="line mono">${escapeHtml(line)}</p>`;
+      html += `</div>`;
+    }
+
+    if(ver.bestSan && ver.bestSan !== state.game.sans[i] &&
+       ver.verdict.key !== 'best' && ver.verdict.key !== 'good' && ver.verdict.key !== 'excellent'){
       html += `<div class="better"><h4>What <span class="mono">${escapeHtml(ver.bestSan)}</span> would have done</h4>` +
               `<p>${escapeHtml(ver.bestNote || '')}</p></div>`;
     }
@@ -4880,6 +5253,11 @@ function renderTabs(){
 function renderControls(){
   $('reviewTools').hidden = state.mode !== 'review';
   $('freeTools').hidden = state.mode !== 'free';
+  const sideBlock = $('sideBlock');
+  if(sideBlock){
+    sideBlock.hidden = state.mode !== 'free';
+    if(!sideBlock.hidden) renderSideRow();
+  }
   $('drillTools').hidden = state.mode !== 'drill';
   $('scanInput').hidden = state.mode !== 'scan' || state.scan.stage === 'ready';
   $('scanEdit').hidden  = state.mode !== 'scan' || state.scan.stage !== 'ready';
@@ -4893,6 +5271,29 @@ function renderControls(){
   if($('btnPrev')) $('btnPrev').disabled = state.mode==='review' ? atStart
                                          : state.mode==='scan' ? true : !state.free.sans.length;
   if($('btnNext')) $('btnNext').disabled = state.mode==='review' ? (!state.game || atEnd) : true;
+}
+
+/* Which colour the player is, as two buttons. Picking one turns the board so
+   that colour is nearest them, because a plan for Black read off a board with
+   White at the bottom is a plan you have to mentally rotate before you can use
+   it — and that is exactly where beginners lose the thread. */
+function renderSideRow(){
+  const row = $('sideRow');
+  if(!row) return;
+  const cur = state.free.side;
+  row.innerHTML = [[ChessEngine.WHITE, 'I am White'], [ChessEngine.BLACK, 'I am Black']]
+    .map(([k, label]) =>
+      `<button type="button" data-side="${k}"${cur === k ? ' class="on"' : ''}>${label}</button>`).join('');
+}
+
+function setFreeSide(side){
+  const f = state.free;
+  if(f.side === side) return;
+  f.side = side;
+  state.flipped = side === ChessEngine.BLACK;   // your colour at the bottom
+  f.plan = null; f.planLine = null; f.engineLines = null;
+  render();
+  askEngineHere();          // the old plan was written for the other player
 }
 
 function renderScan(){
@@ -4985,6 +5386,7 @@ function playFree(move){
   f.fens.push(pos.toFen());
   f.selected = null; f.targets = []; f.promo = null; f.engineLines = null;
   render();
+  askEngineHere();      // the next plan is wanted every time, not on request
 }
 
 function renderPromo(){
@@ -4996,27 +5398,62 @@ function renderPromo(){
     `</span><button class="promo-cancel" data-promo="x">Cancel</button>`;
 }
 
-async function askEngineHere(){
+/* The free board thinks for itself after every move, rather than waiting to be
+   asked. The point of the board is to work out what YOU should be doing, and a
+   plan you have to press a button for is a plan you will forget to ask for.
+
+   Everything below is written from `f.side`'s point of view — the colour the
+   player said they were. That is not cosmetic: an evaluation of +1.40 means
+   opposite things to the two players, and a plan is worthless if you cannot
+   tell whose it is. */
+let freeToken = 0;
+
+async function askEngineHere(deep){
   const f = state.free;
-  if(f.thinking) return;
-  f.thinking = true; f.engineLines = null; renderExplain();
+  const token = ++freeToken;
+  f.thinking = true; f.engineLines = null; f.plan = null; f.planLine = null; renderExplain();
+
   const fen = f.fens[f.fens.length-1];
   const before = posFromFen(fen);
+  const movetime = deep ? 4000 : 1500;
+
   try{
-    const res = await Engine.analyse(fen, {movetime: 1500, multipv: 3});
+    if(!before.legalMoves().length){      // mated or stalemated: nothing to plan
+      f.thinking = false; if(token === freeToken) render();
+      return;
+    }
+    const res = await Engine.analyse(fen, {movetime, multipv: 3});
+    if(token !== freeToken) return;       // a later move has already overtaken this
     const legal = before.legalMoves();
+
+    /* Scores arrive from the point of view of whoever is to move. Turning them
+       round once, here, is what stops every number below from needing to
+       remember whose turn it was. */
+    const toMine = ev => (before.turn === f.side ? ev : Engine.negate(ev));
+
     f.engineLines = res.lines.map(l => {
       const m = uciToMove(before, l.move);
       if(!m) return null;
       return {
         san: before.san(m, legal),
-        ev:  evalText(Engine.toWhitePov({cp:l.cp, mate:l.mate}, before.turn)),
+        ev:  evalText(toMine({cp:l.cp, mate:l.mate})),
         text: Annotator.explain(before, m).short,
       };
     }).filter(Boolean);
+
+    const top = res.lines[0];
+    if(top && top.pv && top.pv.length){
+      f.planEval = toMine({cp: top.cp, mate: top.mate});
+      f.plan = (typeof Plan !== 'undefined')
+                 ? Plan.narrate(fen, top.pv, f.side, f.planEval) : null;
+      f.planLine = uciLineToSan(fen, top.pv, 8);
+      f.planYours = before.turn === f.side;
+      f.planFirstSan = f.engineLines.length ? f.engineLines[0].san : null;
+    }
   }catch(e){
     state.banner = {tone:'bad', text:'The engine did not answer: ' + e.message};
   }
+  if(token !== freeToken) return;
   f.thinking = false;
   render();
 }
@@ -5025,7 +5462,13 @@ async function askEngineHere(){
 function wire(){
   $('modeTabs').addEventListener('click', e => {
     const b = e.target.closest('[data-mode]'); if(!b) return;
-    state.mode = b.dataset.mode; state.banner = null; render();
+    state.mode = b.dataset.mode; state.banner = null;
+    // arriving at the free board should already be thinking about your side
+    if(state.mode === 'free'){
+      state.flipped = state.free.side === ChessEngine.BLACK;
+      if(!state.free.plan && !state.free.thinking){ render(); askEngineHere(); return; }
+    }
+    render();
   });
   $('board').addEventListener('click', e => {
     const b = e.target.closest('.sq'); if(!b) return;
@@ -5045,7 +5488,9 @@ function wire(){
   });
   $('btnPrev').addEventListener('click', () => {
     if(state.mode === 'review') go(state.ply - 1);
-    else { const f = state.free; if(f.sans.length){ f.sans.pop(); f.fens.pop(); f.selected=null; f.targets=[]; f.engineLines=null; render(); } }
+    else { const f = state.free; if(f.sans.length){ f.sans.pop(); f.fens.pop(); f.selected=null; f.targets=[];
+                                                    f.engineLines=null; f.plan=null; f.planLine=null;
+                                                    render(); askEngineHere(); } }
   });
   $('btnNext').addEventListener('click', () => go(state.ply + 1));
   $('btnFlip').addEventListener('click', () => { state.flipped = !state.flipped; renderBoard(); });
@@ -5055,10 +5500,17 @@ function wire(){
     const b = e.target.closest('[data-tab]'); if(!b) return;
     state.tab = b.dataset.tab; renderTabs();
   });
-  $('btnEngineHere').addEventListener('click', askEngineHere);
+  $('btnEngineHere').addEventListener('click', () => askEngineHere(true));
+  $('sideRow').addEventListener('click', e => {
+    // ChessEngine.WHITE/BLACK are the strings 'w' and 'b', so this stays a string
+    const b = e.target.closest('[data-side]'); if(!b) return;
+    setFreeSide(b.dataset.side);
+  });
   $('btnResetFree').addEventListener('click', () => {
-    state.free = {sans:[], fens:[ChessEngine.START], selected:null, targets:[], promo:null, thinking:false, engineLines:null};
+    state.free = {sans:[], fens:[ChessEngine.START], selected:null, targets:[], promo:null, thinking:false,
+                  engineLines:null, side: state.free.side, plan:null, planEval:null, planLine:null};
     render();
+    askEngineHere();
   });
   document.addEventListener('keydown', e => {
     if(e.target.tagName === 'TEXTAREA') return;

@@ -33,6 +33,26 @@ public class MainActivity extends Activity {
      *  browser tab, so it hides its "add to home screen" bar. */
     private static final String PAGE = "file:///android_asset/index.html?native=1";
 
+    /**
+     * The page is loaded with the app's version stuck on the end of the URL.
+     *
+     * <p>The asset inside the APK is replaced on every install, but the WebView
+     * keeps its own cache keyed by URL, and that URL never used to change — so an
+     * upgraded app could still render the page from the version before it, which
+     * looks exactly like a feature that failed to ship. Making the URL move with
+     * the version means an upgrade can never hit the old entry.
+     */
+    private String pageUrl() {
+        String v = "0";
+        try {
+            String name = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            if (name != null) v = name;
+        } catch (Exception e) {
+            // A package that cannot describe itself is not worth failing the launch over.
+        }
+        return PAGE + "&v=" + Uri.encode(v);
+    }
+
     private static final int REQ_FILE = 1;
 
     /** Pictures are handed to the page as a data URL. Full-size phone screenshots
@@ -55,6 +75,9 @@ public class MainActivity extends Activity {
         WebSettings settings = web.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
+        // Everything this page needs is inside the APK, so there is nothing a cache
+        // can usefully save — and plenty it can get wrong across an upgrade.
+        settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
 
         // The board sizes itself to the viewport, so browser zoom would only ever
         // fight the layout.
@@ -97,7 +120,7 @@ public class MainActivity extends Activity {
         if (savedInstanceState != null) {
             web.restoreState(savedInstanceState);
         } else {
-            web.loadUrl(PAGE);
+            web.loadUrl(pageUrl());
         }
         handleShare(getIntent());
     }
